@@ -52,6 +52,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+def _warmup_grls() -> None:
+    try:
+        GRLS_RESOLVER.warmup()
+    except Exception:
+        pass
+
 DB_PATH = os.getenv("DB_PATH", "data/app.db")
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "data/artifacts"))
 RAG_TIMEOUT_S = float(os.getenv("RAG_TIMEOUT_S", "25"))
@@ -233,11 +241,13 @@ class ParseRequest(BaseModel):
     dosage: str
 
 
-def _get_yandex_keys() -> tuple[str, str]:
+def _get_yandex_keys(optional: bool = False) -> tuple[str | None, str | None]:
     folder_id = os.getenv("YANDEX_FOLDER_ID")
     auth_key = os.getenv("YANDEX_AUTH_KEY")
-    if not folder_id or not auth_key:
+    if (not folder_id or not auth_key) and not optional:
         raise HTTPException(status_code=400, detail="YANDEX_FOLDER_ID and YANDEX_AUTH_KEY are required")
+    if not folder_id or not auth_key:
+        return None, None
     return folder_id, auth_key
 
 
@@ -351,7 +361,7 @@ def _run_design_pipeline(
         if progress_cb:
             progress_cb(stage, progress, message, payload)
 
-    folder_id, auth_key = _get_yandex_keys()
+    folder_id, auth_key = _get_yandex_keys(optional=True)
 
     cv_manual = cvIntra.strip().lower() not in ("", "auto")
     skip_be = cv_manual
@@ -462,8 +472,8 @@ def _run_design_pipeline(
         return draft_payload
 
     rag_timeout_s = float(os.getenv("RAG_TIMEOUT_S", "25"))
-    if rag_timeout_s > 60:
-        rag_timeout_s = 60
+    if rag_timeout_s > 120:
+        rag_timeout_s = 120
     deadline_ts = time.time() + rag_timeout_s
     try:
         tavily_key = _get_tavily_key()
@@ -585,20 +595,6 @@ def _run_design_pipeline(
 
     _emit("done", 1.0, "Done", json_payload)
     return json_payload
-@app.get("/api/reference-options")
-def reference_options(inn: str, dosage: str, form: str) -> dict:
-    try:
-        return GRLS_RESOLVER.find_reference_options(inn=inn, dosage=dosage, dosage_form=form, limit=10)
-    except Exception as e:
-        return {"inn": inn, "dosage": dosage, "dosage_form": form, "default_trade_name": "", "options": [], "loading": False, "warning": str(e)}
-
-@app.get("/api/grls-search")
-def grls_search(q: str, dosage: str = "", form: str = "", limit: int = 20) -> dict:
-    try:
-        return GRLS_RESOLVER.search(query=q, dosage=dosage, dosage_form=form, limit=limit)
-    except Exception as e:
-        return {"query": q, "dosage": dosage, "dosage_form": form, "items": [], "loading": False, "warning": str(e)}
-
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -606,17 +602,38 @@ def health() -> dict:
 
 @app.get("/api/reference-options")
 def reference_options(inn: str, dosage: str, form: str) -> dict:
-    return GRLS_RESOLVER.find_reference_options(inn=inn, dosage=dosage, dosage_form=form, limit=10)
+    try:
+        return GRLS_RESOLVER.find_reference_options(inn=inn, dosage=dosage, dosage_form=form, limit=10)
+    except Exception as e:
+        return {
+            "inn": inn,
+            "dosage": dosage,
+            "dosage_form": form,
+            "default_trade_name": "",
+            "options": [],
+            "loading": False,
+            "warning": str(e),
+        }
 
 
 @app.get("/api/grls-search")
 def grls_search(q: str, dosage: str = "", form: str = "", limit: int = 20) -> dict:
-    return GRLS_RESOLVER.search(query=q, dosage=dosage, dosage_form=form, limit=limit)
+    try:
+        return GRLS_RESOLVER.search(query=q, dosage=dosage, dosage_form=form, limit=limit)
+    except Exception as e:
+        return {
+            "query": q,
+            "dosage": dosage,
+            "dosage_form": form,
+            "items": [],
+            "loading": False,
+            "warning": str(e),
+        }
 
 
 @app.post("/api/synopsis")
 def generate_synopsis(payload: SynopsisRequest) -> dict:
-    folder_id, auth_key = _get_yandex_keys()
+    folder_id, auth_key = _get_yandex_keys(optional=True)
     generator = YandexSynopsisGenerator(folder_id=folder_id, auth_key=auth_key)
     result = generator.generate(payload.model_dump())
     _history_insert("synopsis", payload.model_dump(), result)
@@ -686,7 +703,7 @@ async def design_async(
     dropOut: str = Form("0"),
     screenFail: str = Form("0"),
     refTradeName: str = Form(""),
-    mode: str = Form("enrich"),
+    mode: str = Form("fast"),
     file: UploadFile | None = File(None),
 ) -> dict:
     file_path = None
@@ -711,7 +728,7 @@ async def design_async(
                 dropOut=dropOut,
                 screenFail=screenFail,
                 refTradeName=refTradeName,
-                mode=mode if mode in ("fast", "enrich") else "enrich",
+                mode="fast",
                 file_path=file_path,
                 progress_cb=update,
             )
@@ -723,6 +740,59 @@ async def design_async(
                     pass
 
     job = create_job("design", pipeline)
+    return {"jobId": job.id}
+
+
+@app.post("/api/enrich-async")
+async def enrich_async(
+    inn: str = Form(...),
+    form: str = Form(...),
+    dosage: str = Form(...),
+    cvIntra: str = Form("auto"),
+    rsabe: str = Form("false"),
+    design: str = Form("auto"),
+    regimen: str = Form("Натощак"),
+    studyType: str = Form("Однофазное"),
+    constraints: str = Form(""),
+    dropOut: str = Form("0"),
+    screenFail: str = Form("0"),
+    refTradeName: str = Form(""),
+    file: UploadFile | None = File(None),
+) -> dict:
+    file_path = None
+    if file:
+        suffix = os.path.splitext(file.filename or "")[-1] or ".pdf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            file_path = tmp.name
+
+    def pipeline(update):
+        try:
+            return _run_design_pipeline(
+                inn=inn,
+                form=form,
+                dosage=dosage,
+                cvIntra=cvIntra,
+                rsabe=rsabe,
+                design=design,
+                regimen=regimen,
+                studyType=studyType,
+                constraints=constraints,
+                dropOut=dropOut,
+                screenFail=screenFail,
+                refTradeName=refTradeName,
+                mode="enrich",
+                file_path=file_path,
+                progress_cb=update,
+            )
+        finally:
+            if file_path:
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+
+    job = create_job("enrich", pipeline)
     return {"jobId": job.id}
 
 
@@ -907,15 +977,29 @@ async def parse_pdf(
 ) -> dict:
     tavily_key = _get_tavily_key()
     collector = DrugDataCollector(tavily_key=tavily_key)
-    result = collector.get_drug_info(
-        drug_inn=name,
-        dosage=dosage,
-        dosage_form="",
-        regimen="",
-        reference_trade_name=None,
-    )
-    _history_insert("parse-pdf", {"name": name, "dosage": dosage, "file": file.filename}, result)
-    return result
+    file_path = None
+    if file:
+        suffix = os.path.splitext(file.filename or "")[-1] or ".pdf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            file_path = tmp.name
+    try:
+        result = collector.get_drug_info(
+            drug_inn=name,
+            dosage=dosage,
+            dosage_form="",
+            regimen="",
+            reference_trade_name=None,
+            source_path=file_path,
+        )
+        _history_insert("parse-pdf", {"name": name, "dosage": dosage, "file": file.filename}, result)
+        return result
+    finally:
+        if file_path:
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
 
 
 @app.get("/api/history")

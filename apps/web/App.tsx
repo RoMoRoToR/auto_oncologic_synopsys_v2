@@ -19,6 +19,17 @@ import {
   Sigma,
   X,
 } from "lucide-react";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  LineChart,
+  Line,
+  CartesianGrid,
+} from "recharts";
 import { ChatMessage, StudySynopsis } from "./types";
 import {
   chatWithAssistant,
@@ -32,6 +43,7 @@ import {
   grlsSearch,
   DesignFiles,
   apiUrl,
+  enrichProtocolAsync,
 } from "./services/apiService";
 
 const App: React.FC = () => {
@@ -56,7 +68,6 @@ const App: React.FC = () => {
   >([]);
   const [refLoading, setRefLoading] = useState(false);
   const [refError, setRefError] = useState<string | null>(null);
-  const [ragMode, setRagMode] = useState<"fast" | "enrich">("enrich");
 
   // output
   const [loading, setLoading] = useState(false);
@@ -262,6 +273,16 @@ const App: React.FC = () => {
     return !!(f && (f.docx || f.pdf || f.md || f.yaml || f.json));
   };
 
+  const progressSteps = [
+    { key: "draft", label: "Draft" },
+    { key: "discover", label: "Поиск литературы" },
+    { key: "synopsis", label: "Формирование синопсиса" },
+    { key: "export", label: "Экспорт файлов" },
+    { key: "done", label: "Готово" },
+  ];
+  const stageOrder = ["queued", "draft", "discover", "synopsis", "export", "done", "error"];
+  const currentStageIndex = stageOrder.indexOf(jobStage || "");
+
   const runDesign = async (e?: React.FormEvent) => {
     e?.preventDefault?.();
     if (!inn.trim()) return;
@@ -294,7 +315,7 @@ const App: React.FC = () => {
         dropOut,
         screenFail,
         refTradeName: refManual ? refManualValue : refTradeName,
-        mode: ragMode,
+        mode: "fast",
         file: parserFile,
       });
       setJobId(asyncStart.jobId);
@@ -371,6 +392,109 @@ const App: React.FC = () => {
       setLoading(false);
     } finally {
       // loading will be turned off when job completes
+    }
+  };
+
+  const runEnrich = async () => {
+    if (!inn.trim()) return;
+    setLoading(true);
+    setParserError(null);
+
+    if (pollTimerRef.current) window.clearTimeout(pollTimerRef.current);
+    const token =
+      (crypto as any)?.randomUUID?.() ??
+      String(Date.now());
+    pollTokenRef.current = token;
+
+    try {
+      const asyncStart = await enrichProtocolAsync({
+        inn,
+        form,
+        dosage,
+        cvIntra,
+        rsabe,
+        design,
+        regimen,
+        studyType,
+        constraints,
+        dropOut,
+        screenFail,
+        refTradeName: refManual ? refManualValue : refTradeName,
+        file: parserFile,
+      });
+
+      setJobId(asyncStart.jobId);
+
+      let timeoutGraceTries = 0;
+
+      const poll = async () => {
+        if (!asyncStart.jobId) return;
+        if (pollTokenRef.current !== token) return;
+        try {
+          const job = await getJobStatus(asyncStart.jobId);
+          setJobStage(job.stage || null);
+          setJobMessage(job.message || null);
+
+          const result = job.result || null;
+          const artifactsReady = Boolean(job.artifacts_ready) || hasArtifacts(result);
+
+          if (result) {
+            setSynopsis(result?.synopsis || null);
+            setRagData(result?.rag || null);
+            setRagSummary(result?.ragSummary || null);
+            setDecision(result?.decision || null);
+            setStats(result?.stats || null);
+            setTimeline(result?.timeline || null);
+            const newDocx = result?.docxId || result?.docx_id || null;
+            if (newDocx) setDocxId(newDocx);
+            setFiles(result?.files || null);
+          }
+
+          if (artifactsReady && !draftReadyRef.current) {
+            draftReadyRef.current = true;
+            setDraftReady(true);
+            setLoading(false);
+            showToast("ok", "Черновик готов — идёт поиск источников");
+          }
+
+          if (job.status === "done") {
+            setRightTab("synopsis");
+            setLoading(false);
+            showToast("ok", "Источники обновлены");
+            return;
+          }
+
+          if (job.status === "error") {
+            const msg = job.message || "Обогащение прервано";
+            const isTimeout = msg === "timeout" || job.error === "JOB_TIMEOUT";
+            if (isTimeout && !artifactsReady && timeoutGraceTries < 8) {
+              timeoutGraceTries += 1;
+              pollTimerRef.current = window.setTimeout(poll, 1500);
+              return;
+            }
+            if (artifactsReady) {
+              setLoading(false);
+              showToast("err", `${msg} (файлы сохранены)`);
+              return;
+            }
+            setParserError(msg);
+            setLoading(false);
+            showToast("err", msg);
+            return;
+          }
+
+          pollTimerRef.current = window.setTimeout(poll, 2000);
+        } catch (e) {
+          pollTimerRef.current = window.setTimeout(poll, 2000);
+        }
+      };
+
+      pollTimerRef.current = window.setTimeout(poll, 800);
+    } catch (err: any) {
+      const msg = err?.message || "Ошибка обогащения";
+      setParserError(msg);
+      showToast("err", msg);
+      setLoading(false);
     }
   };
 
@@ -963,19 +1087,7 @@ const App: React.FC = () => {
                   </select>
                 </div>
 
-                <div className="mt-3">
-                  <label className="block text-[11px] uppercase tracking-[0.18em] font-extrabold text-slate-400 mb-2">
-                    Режим данных
-                  </label>
-                  <select
-                    value={ragMode}
-                    onChange={(e) => setRagMode(e.target.value as "fast" | "enrich")}
-                    className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm font-semibold outline-none focus:bg-white focus:border-emerald-300 transition-colors"
-                  >
-                    <option value="fast">Быстро (без источников)</option>
-                    <option value="enrich">Уточнить по источникам</option>
-                  </select>
-                </div>
+                
               </div>
 
               {/* Losses */}
@@ -1042,20 +1154,30 @@ const App: React.FC = () => {
                 </div>
               </div>
 
-              <button
-                type="submit"
-                disabled={loading || !inn.trim()}
-                className="w-full rounded-3xl bg-emerald-600 text-white py-4 font-black text-sm shadow hover:bg-emerald-700 active:scale-[0.99] transition-all disabled:opacity-40"
-              >
-                {loading ? (
-                  <span className="inline-flex items-center gap-2">
-                    <Loader2 size={18} className="animate-spin" />
-                    {jobMessage || "Генерация…"}
-                  </span>
-                ) : (
-                  "Сгенерировать / Обновить"
-                )}
-              </button>
+              <div className="grid grid-cols-1 gap-3">
+                <button
+                  type="submit"
+                  disabled={loading || !inn.trim()}
+                  className="w-full rounded-3xl bg-emerald-600 text-white py-4 font-black text-sm shadow hover:bg-emerald-700 active:scale-[0.99] transition-all disabled:opacity-40"
+                >
+                  {loading ? (
+                    <span className="inline-flex items-center gap-2">
+                      <Loader2 size={18} className="animate-spin" />
+                      {jobMessage || "Генерация…"}
+                    </span>
+                  ) : (
+                    "Сгенерировать (Draft)"
+                  )}
+                </button>
+                <button
+                  type="button"
+                  disabled={loading || !inn.trim() || !synopsis}
+                  onClick={() => runEnrich()}
+                  className="w-full rounded-3xl border border-emerald-200 text-emerald-700 py-3 font-bold text-sm hover:bg-emerald-50 transition-all disabled:opacity-40"
+                >
+                  Обогатить источниками
+                </button>
+              </div>
 
               {loading && (
                 <div className="text-[11px] text-slate-500">
@@ -1148,7 +1270,7 @@ const App: React.FC = () => {
                   </div>
                   <div>
                     <div className="font-black text-slate-900">
-                      {isEmpty ? "Введите МНН слева" : "Черновик готов — нажмите «Сгенерировать / Обновить»"}
+                      {isEmpty ? "Введите МНН слева" : "Черновик готов — нажмите «Сгенерировать (Draft)»"}
                     </div>
                     <div className="mt-1 text-sm text-slate-600">
                       Справа появятся выбранный дизайн, расчёт выборки, таймпоинты, источники и секции синопсиса.
@@ -1228,6 +1350,36 @@ const App: React.FC = () => {
               )}
             </Card>
           </div>
+
+          <Card title="Progress Board" icon={<Loader2 size={16} className="text-emerald-700" />}>
+            <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
+              {progressSteps.map((s, idx) => {
+                const isActive = idx === Math.max(0, currentStageIndex - 1);
+                const isDone = currentStageIndex > idx;
+                const isError = jobStage === "error";
+                const state = isError && isActive ? "error" : isDone ? "done" : isActive ? "active" : "idle";
+                return (
+                  <div
+                    key={s.key}
+                    className={`rounded-2xl border px-3 py-3 text-xs font-extrabold uppercase tracking-[0.2em] ${
+                      state === "done"
+                        ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                        : state === "active"
+                        ? "bg-slate-900 border-slate-900 text-white"
+                        : state === "error"
+                        ? "bg-red-50 border-red-200 text-red-700"
+                        : "bg-white border-slate-200 text-slate-500"
+                    }`}
+                  >
+                    {s.label}
+                  </div>
+                );
+              })}
+            </div>
+            <div className="mt-3 text-xs text-slate-500">
+              {jobMessage || "Ожидание задачи"}
+            </div>
+          </Card>
 
           {/* Tabs */}
           <Card title="Рабочая область" icon={<Cpu size={16} className="text-emerald-700" />}>
@@ -1373,6 +1525,52 @@ const App: React.FC = () => {
 
             {!loading && rightTab === "calc" && (
               <div className="space-y-4 text-sm text-slate-700">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="rounded-3xl border border-slate-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-[0.22em] font-extrabold text-slate-500">
+                      Выборка
+                    </div>
+                    <div className="mt-3 h-40">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart
+                          data={[
+                            { name: "Completed", value: stats?.n_required || 0 },
+                            { name: "Dropout adj", value: stats?.n_dropout_adjusted || 0 },
+                            { name: "Screening", value: stats?.n_screening || 0 },
+                          ]}
+                        >
+                          <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                          <YAxis tick={{ fontSize: 10 }} />
+                          <Tooltip />
+                          <Bar dataKey="value" fill="#10b981" radius={[6, 6, 0, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+
+                  <div className="rounded-3xl border border-slate-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-[0.22em] font-extrabold text-slate-500">
+                      Таймпоинты
+                    </div>
+                    <div className="mt-3 h-40">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart
+                          data={(timeline?.timepoints_h || []).map((t: number, i: number) => ({
+                            idx: i + 1,
+                            t,
+                          }))}
+                        >
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="idx" tick={{ fontSize: 10 }} />
+                          <YAxis tick={{ fontSize: 10 }} />
+                          <Tooltip />
+                          <Line type="monotone" dataKey="t" stroke="#0ea5e9" strokeWidth={2} dot={false} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                </div>
+
                 <div className="rounded-3xl border border-slate-200 bg-slate-50 p-5">
                   <div className="text-[11px] uppercase tracking-[0.22em] font-extrabold text-slate-500">
                     Формулы

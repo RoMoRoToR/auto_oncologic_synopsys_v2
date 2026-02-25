@@ -164,10 +164,46 @@ export const designProtocolAsync = async (params: {
   form.append("dropOut", params.dropOut || "0");
   form.append("screenFail", params.screenFail || "0");
   form.append("refTradeName", params.refTradeName || "");
-  form.append("mode", params.mode || "fast");
+  form.append("mode", "fast");
   if (params.file) form.append("file", params.file);
 
   return (await request("/api/design-async", {
+    method: "POST",
+    body: form,
+  })) as { jobId: string };
+};
+
+export const enrichProtocolAsync = async (params: {
+  inn: string;
+  form: string;
+  dosage: string;
+  cvIntra: string;
+  rsabe: boolean;
+  design: string;
+  regimen: string;
+  studyType: string;
+  constraints: string;
+  dropOut: string;
+  screenFail: string;
+  refTradeName: string;
+  file?: File | null;
+}): Promise<{ jobId: string }> => {
+  const form = new FormData();
+  form.append("inn", params.inn);
+  form.append("form", params.form);
+  form.append("dosage", params.dosage);
+  form.append("cvIntra", params.cvIntra);
+  form.append("rsabe", String(params.rsabe));
+  form.append("design", params.design);
+  form.append("regimen", params.regimen);
+  form.append("studyType", params.studyType);
+  form.append("constraints", params.constraints || "");
+  form.append("dropOut", params.dropOut || "0");
+  form.append("screenFail", params.screenFail || "0");
+  form.append("refTradeName", params.refTradeName || "");
+  if (params.file) form.append("file", params.file);
+
+  return (await request("/api/enrich-async", {
     method: "POST",
     body: form,
   })) as { jobId: string };

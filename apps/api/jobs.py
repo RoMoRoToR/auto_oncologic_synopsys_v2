@@ -109,10 +109,11 @@ def _set(job_id: str, **patch) -> None:
             except Exception:
                 patch.pop("progress", None)
 
-        # Merge partial result instead of replacing.
-        if "result" in patch and patch["result"] is not None:
-            job.result = _deep_merge(job.result, patch["result"])
-            job.artifacts_ready = job.artifacts_ready or _has_artifacts(job.result)
+        # Merge partial result instead of replacing; ignore None to avoid wiping result.
+        if "result" in patch:
+            if patch["result"] is not None:
+                job.result = _deep_merge(job.result, patch["result"])
+                job.artifacts_ready = job.artifacts_ready or _has_artifacts(job.result)
             patch.pop("result", None)
 
         for k, v in patch.items():
@@ -121,13 +122,14 @@ def _set(job_id: str, **patch) -> None:
 
 
 def update(job_id: str, stage: str, progress: float, message: str, partial_result: Optional[dict] = None) -> None:
-    _set(
-        job_id,
-        stage=str(stage),
-        progress=float(progress),
-        message=str(message),
-        result=partial_result,
-    )
+    patch = {
+        "stage": str(stage),
+        "progress": float(progress),
+        "message": str(message),
+    }
+    if partial_result is not None:
+        patch["result"] = partial_result
+    _set(job_id, **patch)
 
 
 def create_job(kind: str, fn: Callable[[Callable[..., None]], dict]) -> Job:

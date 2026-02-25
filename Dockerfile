@@ -11,8 +11,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libglib2.0-0 libsm6 libxext6 libxrender1 libx11-6 libxau6 libxdmcp6 libxcb1 libxkbcommon0 libgl1 libgomp1 \
-    tesseract-ocr tesseract-ocr-rus fonts-dejavu-core \
+    fonts-dejavu-core \
   && rm -rf /var/lib/apt/lists/*
 
 COPY packages/rag/requirements.txt /app/requirements-rag.txt

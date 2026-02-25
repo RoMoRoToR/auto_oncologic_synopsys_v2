@@ -188,9 +188,11 @@ class YandexSynopsisGenerator:
         "versionDate",
     }
 
-    def __init__(self, folder_id: str, auth_key: str):
-        sdk = AIStudio(folder_id=folder_id, auth=auth_key)
-        self.model = sdk.models.completions("yandexgpt").configure(temperature=0.2)
+    def __init__(self, folder_id: str | None = None, auth_key: str | None = None):
+        self.model = None
+        if folder_id and auth_key:
+            sdk = AIStudio(folder_id=folder_id, auth=auth_key)
+            self.model = sdk.models.completions("yandexgpt").configure(temperature=0.2)
 
     def generate(
         self,
@@ -201,9 +203,9 @@ class YandexSynopsisGenerator:
         base = self._build_base(params, rag_context or {})
 
         if use_llm is None:
-            use_llm = os.getenv("SYNOPSIS_USE_LLM", "1") == "1"
+            use_llm = (self.model is not None) and (os.getenv("SYNOPSIS_USE_LLM", "1") == "1")
 
-        if use_llm:
+        if use_llm and self.model is not None:
             try:
                 edited = self._llm_polish(base, rag_context or {})
                 merged = self._merge_locked(base, edited)

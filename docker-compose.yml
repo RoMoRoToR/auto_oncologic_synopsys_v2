@@ -9,14 +9,15 @@ services:
       - "8000:8000"
     environment:
       # критично: джоба сейчас "умирает" раньше RAG
-      JOB_TIMEOUT_S: 120
-      RAG_TIMEOUT_S: 25
+      JOB_TIMEOUT_S: 300
+      RAG_TIMEOUT_S: 60
 
       JOBS_WORKERS: 2
 
       # опционально, чтобы PDF-парсер не был слишком агрессивным
       PDF_TIMEOUT_S: 25
       MAX_PDF_MB: 30
+      SYNOPSIS_USE_LLM: 1
 
       DB_PATH: /app/data/app.db
       ARTIFACT_DIR: /app/data/artifacts

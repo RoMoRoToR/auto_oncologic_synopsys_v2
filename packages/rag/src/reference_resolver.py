@@ -192,6 +192,9 @@ class ReferenceResolver:
         t = threading.Thread(target=self._load_blocking, daemon=True)
         t.start()
 
+    def warmup(self) -> None:
+        self._start_load_async()
+
     def _ensure_loaded(self, max_wait_s: float) -> Tuple[bool, Optional[str]]:
         # запускаем прогрев в фоне
         self._start_load_async()
