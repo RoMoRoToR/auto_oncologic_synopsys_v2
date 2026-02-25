@@ -19,18 +19,90 @@ import {
   Sigma,
   X,
 } from "lucide-react";
-import {
-  ResponsiveContainer,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  LineChart,
-  Line,
-  CartesianGrid,
-} from "recharts";
 import { ChatMessage, StudySynopsis } from "./types";
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  BarElement,
+  PointElement,
+  LineElement,
+  Tooltip,
+  Legend,
+  Filler,
+} from "chart.js";
+import { Bar, Line } from "react-chartjs-2";
+
+ChartJS.register(CategoryScale, LinearScale, BarElement, PointElement, LineElement, Tooltip, Legend, Filler);
+
+type SectionField = { label: string; value: any; key: keyof StudySynopsis; list?: boolean };
+
+function SynopsisSection(props: {
+  title: string;
+  sectionKey: string;
+  icon?: React.ReactNode;
+  fields: SectionField[];
+  editSection: string | null;
+  setEditSection: (v: string | null) => void;
+  safeText: (v: any) => string;
+  updateSynopsisField: (key: keyof StudySynopsis, value: string, list?: boolean) => void;
+  synopsisDraft: StudySynopsis | null;
+}) {
+  const { title, sectionKey, icon, fields, editSection, setEditSection, safeText, updateSynopsisField, synopsisDraft } = props;
+  const isEdit = editSection === sectionKey;
+
+  return (
+    <details className="border border-slate-200 rounded-3xl overflow-hidden bg-white" open={isEdit}>
+      <summary className="cursor-pointer list-none px-5 py-4 bg-slate-50 text-sm font-black text-slate-900 flex items-center justify-between">
+        <span className="inline-flex items-center gap-2">
+          {icon}
+          {title}
+        </span>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.preventDefault();
+            setEditSection(isEdit ? null : sectionKey);
+          }}
+          className="text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400 hover:text-emerald-600 transition-colors"
+        >
+          {isEdit ? "Свернуть" : "Редактировать"}
+        </button>
+      </summary>
+
+      <div className="p-5 space-y-4 text-sm text-slate-700">
+        {!isEdit ? (
+          fields.map((f) => (
+            <div key={String(f.key)}>
+              <div className="text-[10px] uppercase tracking-[0.18em] font-extrabold text-slate-400">{f.label}</div>
+              <div className="mt-1 whitespace-pre-wrap">{safeText(f.value)}</div>
+            </div>
+          ))
+        ) : (
+          <div className="space-y-4">
+            {fields.map((f) => {
+              const draftValue = synopsisDraft ? (synopsisDraft as any)[f.key] : f.value;
+              const text = Array.isArray(draftValue) ? draftValue.join("\n") : (draftValue ?? "");
+              return (
+                <div key={String(f.key)}>
+                  <div className="text-[10px] uppercase tracking-[0.18em] font-extrabold text-slate-400 mb-1">{f.label}</div>
+                  <textarea
+                    value={String(text)}
+                    onChange={(e) => updateSynopsisField(f.key, e.target.value, !!f.list)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-xs outline-none focus:border-emerald-400 min-h-[88px]"
+                  />
+                </div>
+              );
+            })}
+            <div className="text-[11px] text-slate-500">
+              Изменения применяются локально. Нажмите «Пересобрать файлы», чтобы обновить DOCX/PDF/JSON.
+            </div>
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
 import {
   chatWithAssistant,
   designProtocol,
@@ -74,6 +146,7 @@ const App: React.FC = () => {
   const [parserError, setParserError] = useState<string | null>(null);
 
   const [synopsis, setSynopsis] = useState<StudySynopsis | null>(null);
+  const [synopsisDraft, setSynopsisDraft] = useState<StudySynopsis | null>(null);
   const [ragData, setRagData] = useState<any | null>(null);
   const [ragSummary, setRagSummary] = useState<any | null>(null);
   const [decision, setDecision] = useState<any | null>(null);
@@ -105,6 +178,9 @@ const App: React.FC = () => {
   const [historyItems, setHistoryItems] = useState<any[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyQuery, setHistoryQuery] = useState("");
+  const [historyKind, setHistoryKind] = useState<string>("all");
+  const [historySelectedId, setHistorySelectedId] = useState<number | null>(null);
 
   // chat
   const [chatOpen, setChatOpen] = useState(false);
@@ -142,6 +218,25 @@ const App: React.FC = () => {
     toastTimer.current = window.setTimeout(() => setToast(null), 2600);
   };
 
+  const safeParse = (text?: string) => {
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+
+  const formatDate = (iso?: string) => {
+    if (!iso) return "";
+    try {
+      const d = new Date(iso);
+      return d.toLocaleString("ru-RU");
+    } catch {
+      return iso;
+    }
+  };
+
   useEffect(() => {
     if (chatEndRef.current) chatEndRef.current.scrollIntoView({ behavior: "smooth" });
   }, [messages, chatLoading]);
@@ -152,6 +247,10 @@ const App: React.FC = () => {
       pollTokenRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (synopsis) setSynopsisDraft(synopsis);
+  }, [synopsis]);
 
   useEffect(() => {
     const i = inn.trim();
@@ -503,6 +602,7 @@ const App: React.FC = () => {
     try {
       const items = await getHistory(30);
       setHistoryItems(items);
+      if (items?.length) setHistorySelectedId(items[0].id);
     } finally {
       setHistoryLoading(false);
     }
@@ -530,6 +630,48 @@ const App: React.FC = () => {
       showToast("ok", "Загружено из истории");
     }
   };
+
+  const historyView = useMemo(() => {
+    const q = historyQuery.trim().toLowerCase();
+    return historyItems
+      .map((item) => {
+        const payload = safeParse(item.payload);
+        const response = safeParse(item.response);
+        return { ...item, payload, response };
+      })
+      .filter((item) => (historyKind === "all" ? true : item.kind === historyKind))
+      .filter((item) => {
+        if (!q) return true;
+        const inn = (item.payload?.inn || item.payload?.name || "").toString().toLowerCase();
+        const title = (item.response?.synopsis?.protocolTitle || "").toString().toLowerCase();
+        const kind = (item.kind || "").toString().toLowerCase();
+        return inn.includes(q) || title.includes(q) || kind.includes(q);
+      })
+      .sort((a, b) => {
+        const da = new Date(a.created_at || 0).getTime();
+        const db = new Date(b.created_at || 0).getTime();
+        return db - da;
+      });
+  }, [historyItems, historyQuery, historyKind]);
+
+  const historyStats = useMemo(() => {
+    const counts: Record<string, number> = {};
+    historyItems.forEach((h) => {
+      counts[h.kind] = (counts[h.kind] || 0) + 1;
+    });
+    return counts;
+  }, [historyItems]);
+
+  const historySelected = useMemo(() => {
+    if (!historySelectedId) return null;
+    return historyView.find((h) => h.id === historySelectedId) || null;
+  }, [historySelectedId, historyView]);
+
+  useEffect(() => {
+    if (!historyOpen) return;
+    if (historySelectedId && historyView.find((h) => h.id === historySelectedId)) return;
+    if (historyView.length) setHistorySelectedId(historyView[0].id);
+  }, [historyOpen, historyView, historySelectedId]);
 
   const openUrl = (path?: string) => {
     if (!path) return;
@@ -576,21 +718,35 @@ const App: React.FC = () => {
   };
 
   const updateSynopsisField = (key: keyof StudySynopsis, value: string, list = false) => {
-    setSynopsis((prev) => {
-      if (!prev) return prev;
-      const next: any = { ...prev };
+    setSynopsisDraft((prev) => {
+      const base = prev || synopsis;
+      if (!base) return prev;
+      const next: any = { ...base };
       next[key] = list ? toList(value) : value;
       return next;
     });
     setSynopsisDirty(true);
   };
 
-  const exportEditedSynopsis = async () => {
+  const applySynopsisDraft = () => {
+    if (!synopsisDraft) return;
+    setSynopsis(synopsisDraft);
+    showToast("ok", "Изменения применены");
+  };
+
+  const resetSynopsisDraft = () => {
     if (!synopsis) return;
+    setSynopsisDraft(synopsis);
+    setSynopsisDirty(false);
+  };
+
+  const exportEditedSynopsis = async () => {
+    const current = synopsisDraft || synopsis;
+    if (!current) return;
     setExportLoading(true);
     try {
       const result = await exportSynopsis({
-        synopsis,
+        synopsis: current,
         decision,
         stats,
         timeline,
@@ -730,88 +886,49 @@ const App: React.FC = () => {
     );
   };
 
-  const Section = ({
-    title,
-    sectionKey,
-    icon,
-    fields,
-  }: {
-    title: string;
-    sectionKey: string;
-    icon?: React.ReactNode;
-    fields: { label: string; value: any; key: keyof StudySynopsis; list?: boolean }[];
-  }) => (
-    <details className="border border-slate-200 rounded-3xl overflow-hidden bg-white" open={editSection === sectionKey}>
-      <summary className="cursor-pointer list-none px-5 py-4 bg-slate-50 text-sm font-black text-slate-900 flex items-center justify-between">
-        <span className="inline-flex items-center gap-2">
-          {icon}
-          {title}
-        </span>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.preventDefault();
-            setEditSection(editSection === sectionKey ? null : sectionKey);
-          }}
-          className="text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400 hover:text-emerald-600 transition-colors"
-        >
-          {editSection === sectionKey ? "Свернуть" : "Редактировать"}
-        </button>
-      </summary>
-
-      <div className="p-5 space-y-4 text-sm text-slate-700">
-        {editSection !== sectionKey ? (
-          fields.map((f, i) => (
-            <div key={i}>
-              <div className="text-[10px] uppercase tracking-[0.18em] font-extrabold text-slate-400">{f.label}</div>
-              <div className="mt-1 whitespace-pre-wrap">{safeText(f.value)}</div>
-            </div>
-          ))
-        ) : (
-          <div className="space-y-4">
-            {fields.map((f, i) => (
-              <div key={i}>
-                <div className="text-[10px] uppercase tracking-[0.18em] font-extrabold text-slate-400 mb-1">{f.label}</div>
-                <textarea
-                  defaultValue={Array.isArray(f.value) ? f.value.join("\n") : safeText(f.value)}
-                  onChange={(e) => updateSynopsisField(f.key, e.target.value, !!f.list)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-3 text-xs outline-none focus:border-emerald-400 min-h-[88px]"
-                />
-              </div>
-            ))}
-            <div className="text-[11px] text-slate-500">
-              Изменения применяются локально. Нажмите «Пересобрать файлы», чтобы обновить DOCX/PDF/JSON.
-            </div>
-          </div>
-        )}
-      </div>
-    </details>
-  );
 
   const Funnel = () => {
     const sf = Math.max(0, Math.min(95, Number(String(screenFail).replace(",", ".")) || 0));
     const dof = Math.max(0, Math.min(95, Number(String(dropOut).replace(",", ".")) || 0));
     const screenRate = 100 - sf;
     const completeRate = Math.max(0, Math.round(screenRate * (1 - dof / 100)));
+    const nScreen = Number(stats?.n_screening || 0);
+    const nComplete = Number(stats?.n_required || 0);
+    const nEligible = nScreen ? Math.round((screenRate / 100) * nScreen) : Math.round((screenRate / 100) * 100);
 
     return (
       <div className="space-y-3">
         <div className="text-xs text-slate-600">
           <span className="font-extrabold">Funnel</span>: screen-fail {sf}% → drop-out {dof}% → завершившие ~{completeRate}% от скрининга
         </div>
-        <div className="h-3 rounded-full bg-slate-100 overflow-hidden">
-          <div className="h-3 bg-slate-900" style={{ width: "100%" }} />
-        </div>
-        <div className="h-3 rounded-full bg-slate-100 overflow-hidden">
-          <div className="h-3 bg-emerald-600" style={{ width: `${screenRate}%` }} />
-        </div>
-        <div className="h-3 rounded-full bg-slate-100 overflow-hidden">
-          <div className="h-3 bg-emerald-500" style={{ width: `${completeRate}%` }} />
-        </div>
-        <div className="grid grid-cols-3 gap-2 text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">
-          <div>Скрининг</div>
-          <div>Допуск</div>
-          <div>Завершили</div>
+        <div className="space-y-2">
+          <div>
+            <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">
+              <span>Скрининг</span>
+              <span>{nScreen || "—"}</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+              <div className="h-2 bg-slate-900 transition-all" style={{ width: "100%" }} />
+            </div>
+          </div>
+          <div>
+            <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">
+              <span>Допуск</span>
+              <span>{nEligible || "—"}</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+              <div className="h-2 bg-emerald-600 transition-all" style={{ width: `${screenRate}%` }} />
+            </div>
+          </div>
+          <div>
+            <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">
+              <span>Завершили</span>
+              <span>{nComplete || "—"}</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-100 overflow-hidden">
+              <div className="h-2 bg-emerald-500 transition-all" style={{ width: `${completeRate}%` }} />
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -834,7 +951,12 @@ const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen relative overflow-hidden">
+      <div className="pointer-events-none absolute inset-0">
+        <div className="absolute -top-24 -left-24 h-[320px] w-[320px] rounded-full bg-emerald-200/40 blur-3xl" />
+        <div className="absolute top-40 -right-24 h-[360px] w-[360px] rounded-full bg-cyan-200/40 blur-3xl" />
+        <div className="absolute bottom-0 left-1/3 h-[260px] w-[260px] rounded-full bg-amber-200/30 blur-3xl" />
+      </div>
       {/* Top bar */}
       <div className="sticky top-0 z-50 px-6 lg:px-10 py-5">
         <div className="rounded-3xl border border-black/10 bg-white/75 backdrop-blur-xl shadow-lift px-5 py-4 flex items-center justify-between">
@@ -857,14 +979,13 @@ const App: React.FC = () => {
             <button
               type="button"
               onClick={() => {
-                setHistoryOpen((v) => !v);
-                if (!historyOpen) loadHistory();
+                setHistoryOpen(true);
+                loadHistory();
               }}
               className="hidden md:inline-flex items-center gap-2 px-4 py-2.5 rounded-2xl border border-slate-200 bg-white text-slate-700 text-xs font-extrabold hover:border-emerald-300 transition-colors"
             >
               <BookOpen size={16} />
               История
-              <ChevronDown size={16} className={`${historyOpen ? "rotate-180" : ""} transition-transform`} />
             </button>
 
             <button
@@ -879,39 +1000,205 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* History dropdown */}
+        {/* History panel */}
         {historyOpen && (
-          <div className="mt-3 rounded-3xl border border-slate-200 bg-white/85 backdrop-blur shadow-soft p-4">
-            <div className="flex items-center justify-between">
-              <div className="text-[11px] uppercase tracking-[0.22em] font-extrabold text-slate-500">
-                Последние действия
+          <div className="fixed inset-0 z-[70]">
+            <div className="absolute inset-0 bg-slate-900/30 backdrop-blur-sm" onClick={() => setHistoryOpen(false)} />
+            <div className="absolute right-6 top-20 bottom-6 w-[960px] max-w-[94vw] rounded-[32px] bg-white shadow-lift border border-slate-200 flex flex-col overflow-hidden">
+              <div className="p-5 border-b border-slate-200 bg-gradient-to-r from-slate-50 via-white to-emerald-50">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-xs uppercase tracking-[0.22em] font-extrabold text-slate-500">История синопсисов</div>
+                    <div className="text-lg font-black text-slate-900">Журнал проектов и версий</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => loadHistory()}
+                      className="px-3 py-2 rounded-2xl text-xs font-extrabold border border-slate-200 bg-white hover:border-emerald-300"
+                    >
+                      Обновить
+                    </button>
+                    <button
+                      type="button"
+                      className="text-xs font-extrabold text-slate-500 hover:text-slate-900"
+                      onClick={() => setHistoryOpen(false)}
+                    >
+                      Закрыть
+                    </button>
+                  </div>
+                </div>
+                <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <input
+                    value={historyQuery}
+                    onChange={(e) => setHistoryQuery(e.target.value)}
+                    placeholder="Поиск по INN, протоколу или типу"
+                    className="md:col-span-2 w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold outline-none focus:border-emerald-300 transition-colors"
+                  />
+                  <div className="flex flex-wrap gap-2">
+                    {["all", "design", "synopsis", "parse-pdf", "chat"].map((k) => (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => setHistoryKind(k)}
+                        className={`px-3 py-1.5 rounded-full text-[10px] font-extrabold uppercase tracking-[0.2em] border ${
+                          historyKind === k
+                            ? "bg-slate-900 text-white border-slate-900"
+                            : "bg-white text-slate-500 border-slate-200"
+                        }`}
+                      >
+                        {k === "all" ? "Все" : k}
+                        {historyStats[k] ? ` • ${historyStats[k]}` : ""}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
-              <button
-                type="button"
-                className="text-xs font-extrabold text-slate-500 hover:text-slate-900"
-                onClick={() => setHistoryOpen(false)}
-              >
-                Закрыть
-              </button>
-            </div>
-            <div className="mt-3 max-h-[240px] overflow-y-auto space-y-2">
-              {historyLoading && (
-                <div className="text-xs text-slate-500">Загрузка…</div>
-              )}
-              {!historyLoading && historyItems.length === 0 && (
-                <div className="text-xs text-slate-500">История пуста.</div>
-              )}
-              {historyItems.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => applyHistoryItem(item.id)}
-                  className="w-full text-left rounded-2xl border border-slate-200 bg-white hover:border-emerald-300 transition-colors px-3 py-2"
-                >
-                  <div className="text-xs font-extrabold text-slate-800">{item.kind}</div>
-                  <div className="text-[11px] text-slate-400">{item.created_at}</div>
-                </button>
-              ))}
+
+              <div className="flex flex-1 min-h-0">
+                <div className="w-[360px] border-r border-slate-200 overflow-y-auto">
+                  <div className="p-4 space-y-3">
+                    {historyLoading && <div className="text-xs text-slate-500">Загрузка…</div>}
+                    {!historyLoading && historyView.length === 0 && (
+                      <div className="text-xs text-slate-500">История пуста.</div>
+                    )}
+                    {historyView.map((item) => {
+                      const inn = item.payload?.inn || item.payload?.name || "—";
+                      const dose = item.payload?.dosage || "";
+                      const title = item.response?.synopsis?.protocolTitle || "Без заголовка";
+                      const isActive = item.id === historySelectedId;
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => setHistorySelectedId(item.id)}
+                          className={`w-full text-left rounded-2xl border p-4 transition-all ${
+                            isActive
+                              ? "border-emerald-400 bg-emerald-50/70 shadow-soft"
+                              : "border-slate-200 bg-white hover:border-emerald-300"
+                          }`}
+                        >
+                          <div className="text-[10px] font-extrabold text-slate-500 uppercase tracking-[0.2em]">
+                            {item.kind}
+                          </div>
+                          <div className="mt-1 text-sm font-black text-slate-900 line-clamp-2">{title}</div>
+                          <div className="text-xs text-slate-500">{inn}{dose ? ` • ${dose} mg` : ""}</div>
+                          <div className="text-[11px] text-slate-400 mt-2">{formatDate(item.created_at)}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto">
+                  <div className="p-6 space-y-6">
+                    {!historySelected && (
+                      <div className="text-sm text-slate-500">Выберите запись слева, чтобы увидеть детали.</div>
+                    )}
+                    {historySelected && (() => {
+                      const payload = historySelected.payload || {};
+                      const response = historySelected.response || {};
+                      const files = response?.files || {};
+                      const synopsisTitle = response?.synopsis?.protocolTitle || "Без заголовка";
+                      const cvUsed = response?.stats?.assumptions?.cv_intra || payload?.cvIntra || "—";
+                      const designType = response?.decision?.design || payload?.design || "—";
+                      const nRequired = response?.stats?.n_required ?? "—";
+                      const nScreen = response?.stats?.n_screening ?? "—";
+
+                      return (
+                        <>
+                          <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-soft">
+                            <div className="flex items-start justify-between gap-4">
+                              <div>
+                                <div className="text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">
+                                  {historySelected.kind}
+                                </div>
+                                <div className="mt-1 text-xl font-black text-slate-900">{synopsisTitle}</div>
+                                <div className="text-sm text-slate-600 mt-1">
+                                  {payload.inn || payload.name || "—"} • {payload.dosage || "—"} mg • {payload.form || "—"} • {payload.regimen || "—"}
+                                </div>
+                                <div className="text-[11px] text-slate-400 mt-2">{formatDate(historySelected.created_at)}</div>
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => applyHistoryItem(historySelected.id)}
+                                  className="px-4 py-2 rounded-2xl text-xs font-extrabold bg-emerald-600 text-white hover:bg-emerald-700"
+                                >
+                                  Открыть
+                                </button>
+                                {files?.docx && (
+                                  <button
+                                    type="button"
+                                    onClick={() => openUrl(files.docx)}
+                                    className="px-3 py-2 rounded-2xl text-xs font-extrabold border border-slate-200 bg-white"
+                                  >
+                                    DOCX
+                                  </button>
+                                )}
+                                {files?.pdf && (
+                                  <button
+                                    type="button"
+                                    onClick={() => openUrl(files.pdf)}
+                                    className="px-3 py-2 rounded-2xl text-xs font-extrabold border border-slate-200 bg-white"
+                                  >
+                                    PDF
+                                  </button>
+                                )}
+                                {files?.md && (
+                                  <button
+                                    type="button"
+                                    onClick={() => openUrl(files.md)}
+                                    className="px-3 py-2 rounded-2xl text-xs font-extrabold border border-slate-200 bg-white"
+                                  >
+                                    MD
+                                  </button>
+                                )}
+                                {files?.yaml && (
+                                  <button
+                                    type="button"
+                                    onClick={() => openUrl(files.yaml)}
+                                    className="px-3 py-2 rounded-2xl text-xs font-extrabold border border-slate-200 bg-white"
+                                  >
+                                    YAML
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div className="rounded-3xl border border-slate-200 bg-slate-50 p-4">
+                              <div className="text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">Дизайн</div>
+                              <div className="mt-2 text-lg font-black text-slate-900">{designType}</div>
+                              <div className="text-xs text-slate-500 mt-1">CVintra: {cvUsed}</div>
+                            </div>
+                            <div className="rounded-3xl border border-slate-200 bg-slate-50 p-4">
+                              <div className="text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">Выборка</div>
+                              <div className="mt-2 text-lg font-black text-slate-900">{nRequired}</div>
+                              <div className="text-xs text-slate-500 mt-1">Скрининг: {nScreen}</div>
+                            </div>
+                            <div className="rounded-3xl border border-slate-200 bg-slate-50 p-4">
+                              <div className="text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">Источники</div>
+                              <div className="mt-2 text-lg font-black text-slate-900">
+                                {Array.isArray(response?.rag?.evidence_docs) ? response.rag.evidence_docs.length : 0}
+                              </div>
+                              <div className="text-xs text-slate-500 mt-1">evidence docs</div>
+                            </div>
+                          </div>
+
+                          <div className="rounded-3xl border border-slate-200 bg-white p-5">
+                            <div className="text-[10px] uppercase tracking-[0.22em] font-extrabold text-slate-400">Сводка</div>
+                            <div className="mt-2 text-sm text-slate-700 whitespace-pre-wrap">
+                              {response?.synopsis?.objectives || response?.synopsis?.methodology || "Нет текста"}
+                            </div>
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -1468,7 +1755,7 @@ const App: React.FC = () => {
 
             {!loading && rightTab === "synopsis" && synopsis && (
               <div className="space-y-4">
-                <Section
+                <SynopsisSection
                   title="Общие сведения"
                   sectionKey="meta"
                   icon={<Info size={16} className="text-emerald-700" />}
@@ -1476,9 +1763,14 @@ const App: React.FC = () => {
                     { label: "Название протокола", value: synopsis.protocolTitle, key: "protocolTitle" },
                     { label: "Номер протокола", value: synopsis.protocolNumber, key: "protocolNumber" },
                   ]}
+                  editSection={editSection}
+                  setEditSection={setEditSection}
+                  safeText={safeText}
+                  updateSynopsisField={updateSynopsisField}
+                  synopsisDraft={synopsisDraft}
                 />
 
-                <Section
+                <SynopsisSection
                   title="Цели"
                   sectionKey="obj"
                   icon={<Activity size={16} className="text-emerald-700" />}
@@ -1486,9 +1778,14 @@ const App: React.FC = () => {
                     { label: "Objectives", value: synopsis.objectives, key: "objectives" },
                     { label: "Tasks (по одной в строке)", value: synopsis.tasks, key: "tasks", list: true },
                   ]}
+                  editSection={editSection}
+                  setEditSection={setEditSection}
+                  safeText={safeText}
+                  updateSynopsisField={updateSynopsisField}
+                  synopsisDraft={synopsisDraft}
                 />
 
-                <Section
+                <SynopsisSection
                   title="Дизайн и методология"
                   sectionKey="design"
                   icon={<Sigma size={16} className="text-emerald-700" />}
@@ -1497,9 +1794,14 @@ const App: React.FC = () => {
                     { label: "Study periods", value: synopsis.studyPeriods, key: "studyPeriods" },
                     { label: "Methodology", value: synopsis.methodology, key: "methodology" },
                   ]}
+                  editSection={editSection}
+                  setEditSection={setEditSection}
+                  safeText={safeText}
+                  updateSynopsisField={updateSynopsisField}
+                  synopsisDraft={synopsisDraft}
                 />
 
-                <Section
+                <SynopsisSection
                   title="Популяция"
                   sectionKey="pop"
                   icon={<ShieldCheck size={16} className="text-emerald-700" />}
@@ -1508,9 +1810,14 @@ const App: React.FC = () => {
                     { label: "Inclusion (по одной в строке)", value: synopsis.inclusionCriteria, key: "inclusionCriteria", list: true },
                     { label: "Exclusion (по одной в строке)", value: synopsis.exclusionCriteria, key: "exclusionCriteria", list: true },
                   ]}
+                  editSection={editSection}
+                  setEditSection={setEditSection}
+                  safeText={safeText}
+                  updateSynopsisField={updateSynopsisField}
+                  synopsisDraft={synopsisDraft}
                 />
 
-                <Section
+                <SynopsisSection
                   title="Статистика"
                   sectionKey="stats"
                   icon={<Sigma size={16} className="text-emerald-700" />}
@@ -1519,6 +1826,11 @@ const App: React.FC = () => {
                     { label: "BE criteria", value: synopsis.beCriteria, key: "beCriteria" },
                     { label: "Sample size calculation", value: synopsis.sampleSizeCalculation, key: "sampleSizeCalculation" },
                   ]}
+                  editSection={editSection}
+                  setEditSection={setEditSection}
+                  safeText={safeText}
+                  updateSynopsisField={updateSynopsisField}
+                  synopsisDraft={synopsisDraft}
                 />
               </div>
             )}
@@ -1531,20 +1843,32 @@ const App: React.FC = () => {
                       Выборка
                     </div>
                     <div className="mt-3 h-40">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <BarChart
-                          data={[
-                            { name: "Completed", value: stats?.n_required || 0 },
-                            { name: "Dropout adj", value: stats?.n_dropout_adjusted || 0 },
-                            { name: "Screening", value: stats?.n_screening || 0 },
-                          ]}
-                        >
-                          <XAxis dataKey="name" tick={{ fontSize: 10 }} />
-                          <YAxis tick={{ fontSize: 10 }} />
-                          <Tooltip />
-                          <Bar dataKey="value" fill="#10b981" radius={[6, 6, 0, 0]} />
-                        </BarChart>
-                      </ResponsiveContainer>
+                      <Bar
+                        data={{
+                          labels: ["Completed", "Dropout adj", "Screening"],
+                          datasets: [
+                            {
+                              label: "N",
+                              data: [
+                                stats?.n_required || 0,
+                                stats?.n_dropout_adjusted || 0,
+                                stats?.n_screening || 0,
+                              ],
+                              backgroundColor: ["#10b981", "#34d399", "#0ea5e9"],
+                              borderRadius: 8,
+                            },
+                          ],
+                        }}
+                        options={{
+                          responsive: true,
+                          maintainAspectRatio: false,
+                          plugins: { legend: { display: false } },
+                          scales: {
+                            x: { ticks: { font: { size: 10 } } },
+                            y: { ticks: { font: { size: 10 } } },
+                          },
+                        }}
+                      />
                     </div>
                   </div>
 
@@ -1553,20 +1877,31 @@ const App: React.FC = () => {
                       Таймпоинты
                     </div>
                     <div className="mt-3 h-40">
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart
-                          data={(timeline?.timepoints_h || []).map((t: number, i: number) => ({
-                            idx: i + 1,
-                            t,
-                          }))}
-                        >
-                          <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="idx" tick={{ fontSize: 10 }} />
-                          <YAxis tick={{ fontSize: 10 }} />
-                          <Tooltip />
-                          <Line type="monotone" dataKey="t" stroke="#0ea5e9" strokeWidth={2} dot={false} />
-                        </LineChart>
-                      </ResponsiveContainer>
+                      <Line
+                        data={{
+                          labels: (timeline?.timepoints_h || []).map((_: number, i: number) => i + 1),
+                          datasets: [
+                            {
+                              label: "Time (h)",
+                              data: timeline?.timepoints_h || [],
+                              borderColor: "#0ea5e9",
+                              backgroundColor: "rgba(14,165,233,0.2)",
+                              fill: true,
+                              tension: 0.3,
+                              pointRadius: 2,
+                            },
+                          ],
+                        }}
+                        options={{
+                          responsive: true,
+                          maintainAspectRatio: false,
+                          plugins: { legend: { display: false } },
+                          scales: {
+                            x: { ticks: { font: { size: 10 } } },
+                            y: { ticks: { font: { size: 10 } } },
+                          },
+                        }}
+                      />
                     </div>
                   </div>
                 </div>

@@ -14,6 +14,25 @@
 
 Шаблон DOCX **не нужен** — документ генерируется программно.
 
+## Продакшен (сервер)
+
+Рекомендованный способ — через `docker-compose.prod.yml` (app + nginx).
+
+1. Создайте `.env` на сервере (можно на основе `.env.prod.example`).
+2. Подготовьте данные:
+   - `./data/grls.xlsx`
+   - `./data/docx/` (папка для артефактов)
+3. Запуск:
+   ```bash
+   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+   ```
+4. Откройте интерфейс: `http://<server_ip>/`.
+
+Примечания:
+- `WEB_CONCURRENCY` задаёт число воркеров uvicorn.
+- `JOB_TIMEOUT_S` и `RAG_TIMEOUT_S` управляют пайплайнами задач.
+- Если ключей `TAVILY_API_KEY/YANDEX_*` нет — система работает в fast‑режиме без обогащения.
+
 ## Локальная разработка
 
 Backend:
