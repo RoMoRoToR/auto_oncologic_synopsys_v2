@@ -1,0 +1,18 @@
+services:
+  bioequiv-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ""
+    ports:
+      - "8000:8000"
+    environment:
+      RAG_TIMEOUT_S: 600
+      TAVILY_API_KEY: ${TAVILY_API_KEY}
+      YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID}
+      YANDEX_AUTH_KEY: ${YANDEX_AUTH_KEY}
+      DOCX_DIR: /app/data/docx
+      GRLS_XLSX_PATH: /app/data/grls.xlsx
+    volumes:
+      - ./data:/app/data
