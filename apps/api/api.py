@@ -5,6 +5,7 @@ import sqlite3
 import uuid
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Callable, Any
@@ -264,6 +265,17 @@ def _quick_sources(inn: str, dosage: str, regimen: str) -> list[dict]:
         return []
 
 
+def _run_with_timeout(fn: Callable[[], Any], timeout_s: float, fallback: Any) -> Any:
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(fn)
+        try:
+            return fut.result(timeout=timeout_s)
+        except TimeoutError:
+            return fallback
+        except Exception:
+            return fallback
+
+
 def _export_artifacts(
     synopsis_inputs: dict,
     synopsis: dict,
@@ -391,6 +403,7 @@ def _run_design_pipeline(
             "stats": stats,
             "timeline": timeline,
         },
+        use_llm=False,
     )
     if progress_cb:
         progress_cb("export", 0.35, "Формирование черновика", None)
@@ -449,6 +462,8 @@ def _run_design_pipeline(
         return draft_payload
 
     rag_timeout_s = float(os.getenv("RAG_TIMEOUT_S", "25"))
+    if rag_timeout_s > 60:
+        rag_timeout_s = 60
     deadline_ts = time.time() + rag_timeout_s
     try:
         tavily_key = _get_tavily_key()
@@ -461,8 +476,8 @@ def _run_design_pipeline(
 
     collector = DrugDataCollector(tavily_key=tavily_key)
     _emit("discover", 0.5, "Поиск источников")
-    try:
-        rag_enriched = collector.get_drug_info(
+    rag_enriched = _run_with_timeout(
+        lambda: collector.get_drug_info(
             drug_inn=inn,
             dosage=dosage,
             dosage_form=form,
@@ -472,11 +487,13 @@ def _run_design_pipeline(
             skip_instruction=skip_instruction,
             deadline_ts=deadline_ts,
             source_path=file_path,
-        )
-    except Exception as e:
-        rag_enriched = rag_result
+        ),
+        timeout_s=rag_timeout_s,
+        fallback=rag_result,
+    )
+    if rag_enriched is rag_result:
         rag_enriched.setdefault("notes", {})
-        rag_enriched["notes"]["rag_error"] = f"rag_error: {e}"
+        rag_enriched["notes"]["rag_error"] = "rag_timeout_or_error"
 
     rag_summary = summarize_rag(rag_enriched)
     if not rag_enriched.get("evidence_docs"):
@@ -568,7 +585,19 @@ def _run_design_pipeline(
 
     _emit("done", 1.0, "Done", json_payload)
     return json_payload
+@app.get("/api/reference-options")
+def reference_options(inn: str, dosage: str, form: str) -> dict:
+    try:
+        return GRLS_RESOLVER.find_reference_options(inn=inn, dosage=dosage, dosage_form=form, limit=10)
+    except Exception as e:
+        return {"inn": inn, "dosage": dosage, "dosage_form": form, "default_trade_name": "", "options": [], "loading": False, "warning": str(e)}
 
+@app.get("/api/grls-search")
+def grls_search(q: str, dosage: str = "", form: str = "", limit: int = 20) -> dict:
+    try:
+        return GRLS_RESOLVER.search(query=q, dosage=dosage, dosage_form=form, limit=limit)
+    except Exception as e:
+        return {"query": q, "dosage": dosage, "dosage_form": form, "items": [], "loading": False, "warning": str(e)}
 
 @app.get("/api/health")
 def health() -> dict:

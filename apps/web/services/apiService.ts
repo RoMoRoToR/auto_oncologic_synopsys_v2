@@ -1,22 +1,40 @@
 import { StudySynopsis } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "";
+const DEFAULT_TIMEOUT_MS = Number(import.meta.env.VITE_HTTP_TIMEOUT_MS || 30000);
 
-const request = async (path: string, options: RequestInit) => {
-  const response = await fetch(`${API_BASE}${path}`, options);
-  const contentType = response.headers.get("content-type") || "";
-  const isJson = contentType.includes("application/json");
-  const body = isJson ? await response.json() : await response.text();
+const request = async (path: string, options: RequestInit, timeoutMs = DEFAULT_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      signal: controller.signal,
+      credentials: "same-origin",
+    });
+    const contentType = response.headers.get("content-type") || "";
+    const isJson = contentType.includes("application/json");
+    const body = isJson ? await response.json() : await response.text();
 
-  if (!response.ok) {
-    const message =
-      typeof body === "string"
-        ? body
-        : body?.detail || body?.message || "Ошибка запроса";
-    throw new Error(message);
+    if (!response.ok) {
+      const message =
+        typeof body === "string"
+          ? body
+          : body?.detail || body?.message || "Ошибка запроса";
+      throw new Error(message);
+    }
+    return body;
+  } catch (e: any) {
+    if (e?.name === "AbortError") {
+      throw new Error("timeout");
+    }
+    throw e;
+  } finally {
+    window.clearTimeout(timer);
   }
-  return body;
 };
+
+export const apiUrl = (path: string) => (path.startsWith("http") ? path : `${API_BASE}${path}`);
 
 export const chatWithAssistant = async (
   message: string,

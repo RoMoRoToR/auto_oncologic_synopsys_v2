@@ -1,8 +1,13 @@
 .env
-.env
-
-.env
 *.db
-**/*.db
 __pycache__/
+*.pyc
 .DS_Store
+
+node_modules/
+dist/
+apps/web/dist/
+
+data/artifacts/
+.idea/
+.vscode/

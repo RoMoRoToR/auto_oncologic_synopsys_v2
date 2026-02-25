@@ -1,12 +1,10 @@
+# packages/rag/src/reference_resolver.py
 from __future__ import annotations
-
-import os
-import re
+import os, re, threading
 from dataclasses import dataclass
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
 import openpyxl
 
 
@@ -18,10 +16,7 @@ def _norm(s: Any) -> str:
 
 
 def _parse_dose_mg(dosage: str) -> Optional[float]:
-    s = _norm(dosage)
-    if not s:
-        return None
-    s = s.replace(",", ".")
+    s = _norm(dosage).replace(",", ".")
     m = re.search(r"([0-9]+(?:\.[0-9]+)?)", s)
     if not m:
         return None
@@ -48,9 +43,7 @@ def _date_to_iso(x: Any) -> Optional[str]:
 
 
 def _date_sort_key(iso: Optional[str]) -> Tuple[int, str]:
-    if not iso:
-        return (1, "9999-12-31")
-    return (0, iso)
+    return (1, "9999-12-31") if not iso else (0, iso)
 
 
 def _form_match(form_text: str, wanted_form: str) -> bool:
@@ -96,21 +89,25 @@ class GrlsRecord:
 class ReferenceResolver:
     """
     GRLS Excel:
+      C = номер РУ
+      D = дата регистрации
       I = торговое наименование
       J = МНН
       K = формы выпуска
-      D = дата регистрации
-      C = номер РУ
     """
 
     def __init__(self, xlsx_path: str | None = None, sheet_name: str = "Действующий"):
         self.xlsx_path = Path(xlsx_path or os.getenv("GRLS_XLSX_PATH", "data/grls.xlsx"))
         self.sheet_name = sheet_name
 
-        # Do not fail hard if file is missing; return empty list instead.
         self._records: List[GrlsRecord] = []
         self._loaded = False
+        self._loading = False
+        self._load_error: Optional[str] = None
         self._last_mtime: float | None = None
+
+        self._lock = threading.Lock()
+        self._loaded_event = threading.Event()
 
     def _score(self, rec: GrlsRecord, inn_q: str, dose_mg: Optional[float], form: str) -> int:
         score = 0
@@ -127,59 +124,105 @@ class ReferenceResolver:
             score += 6
         return score
 
-    def _load(self) -> None:
-        if self._loaded:
-            return
-        if not self.xlsx_path.exists():
-            self._records = []
-            self._loaded = True
-            return
+    def _load_blocking(self) -> None:
+        with self._lock:
+            self._loading = True
+            self._load_error = None
 
-        mtime = self.xlsx_path.stat().st_mtime
-        if self._last_mtime == mtime and self._loaded:
-            return
+        try:
+            if not self.xlsx_path.exists():
+                with self._lock:
+                    self._records = []
+                    self._loaded = True
+                return
 
-        wb = openpyxl.load_workbook(self.xlsx_path, read_only=True, data_only=True)
-        if self.sheet_name not in wb.sheetnames:
-            raise ValueError(f"Sheet not found: {self.sheet_name}. Available: {wb.sheetnames}")
-        ws = wb[self.sheet_name]
+            mtime = self.xlsx_path.stat().st_mtime
+            with self._lock:
+                if self._loaded and self._last_mtime == mtime:
+                    return
 
-        for r in range(6, ws.max_row + 1):
-            reg_no = ws.cell(r, 3).value
-            reg_date = ws.cell(r, 4).value
-            trade = ws.cell(r, 9).value
-            inn = ws.cell(r, 10).value
-            forms = ws.cell(r, 11).value
+            wb = openpyxl.load_workbook(self.xlsx_path, read_only=True, data_only=True)
 
-            if not trade or not inn or not forms:
-                continue
+            # fallback на первый лист
+            sheet = self.sheet_name if self.sheet_name in wb.sheetnames else wb.sheetnames[0]
+            ws = wb[sheet]
 
-            rec = GrlsRecord(
-                reg_no=str(reg_no or "").strip(),
-                reg_date_iso=_date_to_iso(reg_date),
-                trade_name=str(trade).strip(),
-                inn=str(inn).strip(),
-                forms=str(forms).strip(),
-            )
-            self._records.append(rec)
+            recs: List[GrlsRecord] = []
 
-        self._last_mtime = mtime
-        self._loaded = True
+            # быстрее, чем ws.cell(...)
+            for row in ws.iter_rows(min_row=6, min_col=3, max_col=11, values_only=True):
+                # col3..11 => индекс 0..8
+                reg_no = row[0]
+                reg_date = row[1]
+                trade = row[6]   # I
+                inn = row[7]     # J
+                forms = row[8]   # K
+                if not trade or not inn or not forms:
+                    continue
+                recs.append(
+                    GrlsRecord(
+                        reg_no=str(reg_no or "").strip(),
+                        reg_date_iso=_date_to_iso(reg_date),
+                        trade_name=str(trade).strip(),
+                        inn=str(inn).strip(),
+                        forms=str(forms).strip(),
+                    )
+                )
 
-    def find_reference_options(
-        self,
-        inn: str,
-        dosage: str,
-        dosage_form: str,
-        limit: int = 10,
-    ) -> Dict[str, Any]:
-        self._load()
+            with self._lock:
+                self._records = recs
+                self._loaded = True
+                self._last_mtime = mtime
+
+        except Exception as e:
+            with self._lock:
+                self._load_error = str(e)
+                # важное: не ставим _loaded=True, чтобы можно было повторить
+        finally:
+            with self._lock:
+                self._loading = False
+                self._loaded_event.set()
+
+    def _start_load_async(self) -> None:
+        with self._lock:
+            if self._loaded or self._loading:
+                return
+            self._loaded_event.clear()
+            self._loading = True
+        t = threading.Thread(target=self._load_blocking, daemon=True)
+        t.start()
+
+    def _ensure_loaded(self, max_wait_s: float) -> Tuple[bool, Optional[str]]:
+        # запускаем прогрев в фоне
+        self._start_load_async()
+
+        # ждём чуть-чуть (не блокируем API надолго)
+        self._loaded_event.wait(timeout=max_wait_s)
+
+        with self._lock:
+            return self._loaded, self._load_error
+
+    def find_reference_options(self, inn: str, dosage: str, dosage_form: str, limit: int = 10) -> Dict[str, Any]:
+        loaded, err = self._ensure_loaded(max_wait_s=0.15)
+        if not loaded:
+            return {
+                "inn": inn,
+                "dosage": dosage,
+                "dosage_form": dosage_form,
+                "default_trade_name": "",
+                "options": [],
+                "loading": True,
+                "warning": err or "GRLS is loading",
+            }
 
         inn_q = _norm(inn)
         dose_mg = _parse_dose_mg(dosage)
 
+        with self._lock:
+            records = list(self._records)
+
         candidates: List[GrlsRecord] = []
-        for rec in self._records:
+        for rec in records:
             if inn_q and inn_q not in _norm(rec.inn):
                 continue
             if not _dose_match(rec.forms, dose_mg):
@@ -189,7 +232,7 @@ class ReferenceResolver:
             candidates.append(rec)
 
         if not candidates:
-            for rec in self._records:
+            for rec in records:
                 if inn_q and inn_q not in _norm(rec.inn):
                     continue
                 if not _dose_match(rec.forms, dose_mg):
@@ -208,9 +251,7 @@ class ReferenceResolver:
         options = sorted(
             best_by_trade.values(),
             key=lambda x: (-self._score(x, inn_q, dose_mg, dosage_form), _date_sort_key(x.reg_date_iso), _norm(x.trade_name)),
-        )
-
-        options = options[:limit]
+        )[:limit]
 
         default_trade = options[0].trade_name if options else ""
         return {
@@ -219,51 +260,36 @@ class ReferenceResolver:
             "dosage_form": dosage_form,
             "default_trade_name": default_trade,
             "options": [
-                {
-                    "trade_name": r.trade_name,
-                    "reg_no": r.reg_no,
-                    "reg_date": r.reg_date_iso,
-                    "forms": r.forms,
-                    "inn": r.inn,
-                    "score": self._score(r, inn_q, dose_mg, dosage_form),
-                }
+                {"trade_name": r.trade_name, "reg_no": r.reg_no, "reg_date": r.reg_date_iso, "forms": r.forms, "inn": r.inn,
+                 "score": self._score(r, inn_q, dose_mg, dosage_form)}
                 for r in options
             ],
+            "loading": False,
         }
 
-    def search(
-        self,
-        query: str,
-        dosage: str = "",
-        dosage_form: str = "",
-        limit: int = 20,
-    ) -> Dict[str, Any]:
-        self._load()
+    def search(self, query: str, dosage: str = "", dosage_form: str = "", limit: int = 20) -> Dict[str, Any]:
+        loaded, err = self._ensure_loaded(max_wait_s=0.15)
+        if not loaded:
+            return {"query": query, "dosage": dosage, "dosage_form": dosage_form, "items": [], "loading": True, "warning": err or "GRLS is loading"}
+
         q = _norm(query)
         dose_mg = _parse_dose_mg(dosage)
+
+        with self._lock:
+            records = list(self._records)
+
         matches: List[GrlsRecord] = []
-        for rec in self._records:
+        for rec in records:
             if q and (q not in _norm(rec.trade_name) and q not in _norm(rec.inn)):
                 continue
             matches.append(rec)
-        matches = sorted(
-            matches,
-            key=lambda r: (-self._score(r, q, dose_mg, dosage_form), _date_sort_key(r.reg_date_iso), _norm(r.trade_name)),
-        )
-        matches = matches[:limit]
+
+        matches = sorted(matches, key=lambda r: (-self._score(r, q, dose_mg, dosage_form), _date_sort_key(r.reg_date_iso), _norm(r.trade_name)))[:limit]
         return {
             "query": query,
             "dosage": dosage,
             "dosage_form": dosage_form,
-            "items": [
-                {
-                    "trade_name": r.trade_name,
-                    "reg_no": r.reg_no,
-                    "reg_date": r.reg_date_iso,
-                    "forms": r.forms,
-                    "inn": r.inn,
-                    "score": self._score(r, q, dose_mg, dosage_form),
-                }
-                for r in matches
-            ],
+            "items": [{"trade_name": r.trade_name, "reg_no": r.reg_no, "reg_date": r.reg_date_iso, "forms": r.forms, "inn": r.inn,
+                       "score": self._score(r, q, dose_mg, dosage_form)} for r in matches],
+            "loading": False,
         }

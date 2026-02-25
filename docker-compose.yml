@@ -8,11 +8,22 @@ services:
     ports:
       - "8000:8000"
     environment:
-      RAG_TIMEOUT_S: 600
+      # критично: джоба сейчас "умирает" раньше RAG
+      JOB_TIMEOUT_S: 120
+      RAG_TIMEOUT_S: 25
+
+      JOBS_WORKERS: 2
+
+      # опционально, чтобы PDF-парсер не был слишком агрессивным
+      PDF_TIMEOUT_S: 25
+      MAX_PDF_MB: 30
+
+      DB_PATH: /app/data/app.db
+      ARTIFACT_DIR: /app/data/artifacts
+      GRLS_XLSX_PATH: /app/data/grls.xlsx
+
       TAVILY_API_KEY: ${TAVILY_API_KEY}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID}
       YANDEX_AUTH_KEY: ${YANDEX_AUTH_KEY}
-      DOCX_DIR: /app/data/docx
-      GRLS_XLSX_PATH: /app/data/grls.xlsx
     volumes:
       - ./data:/app/data

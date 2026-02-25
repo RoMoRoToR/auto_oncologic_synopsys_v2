@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import date
+import os
 from typing import Any, Dict, List, Optional
 
 from yandex_ai_studio_sdk import AIStudio
@@ -191,13 +192,24 @@ class YandexSynopsisGenerator:
         sdk = AIStudio(folder_id=folder_id, auth=auth_key)
         self.model = sdk.models.completions("yandexgpt").configure(temperature=0.2)
 
-    def generate(self, params: Dict[str, Any], rag_context: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    def generate(
+        self,
+        params: Dict[str, Any],
+        rag_context: Dict[str, Any] | None = None,
+        use_llm: bool | None = None,
+    ) -> Dict[str, Any]:
         base = self._build_base(params, rag_context or {})
 
-        try:
-            edited = self._llm_polish(base, rag_context or {})
-            merged = self._merge_locked(base, edited)
-        except Exception:
+        if use_llm is None:
+            use_llm = os.getenv("SYNOPSIS_USE_LLM", "1") == "1"
+
+        if use_llm:
+            try:
+                edited = self._llm_polish(base, rag_context or {})
+                merged = self._merge_locked(base, edited)
+            except Exception:
+                merged = base
+        else:
             merged = base
 
         merged["markdown"] = _to_markdown(merged)

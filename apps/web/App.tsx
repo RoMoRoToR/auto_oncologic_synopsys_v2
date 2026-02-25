@@ -31,6 +31,7 @@ import {
   exportSynopsis,
   grlsSearch,
   DesignFiles,
+  apiUrl,
 } from "./services/apiService";
 
 const App: React.FC = () => {
@@ -77,6 +78,10 @@ const App: React.FC = () => {
   const [jobId, setJobId] = useState<string | null>(null);
   const [jobStage, setJobStage] = useState<string | null>(null);
   const [jobMessage, setJobMessage] = useState<string | null>(null);
+  const [draftReady, setDraftReady] = useState(false);
+  const draftReadyRef = useRef(false);
+  const pollTokenRef = useRef<string | null>(null);
+  const pollTimerRef = useRef<number | null>(null);
   const [synopsisDirty, setSynopsisDirty] = useState(false);
   const [exportLoading, setExportLoading] = useState(false);
 
@@ -131,6 +136,13 @@ const App: React.FC = () => {
   }, [messages, chatLoading]);
 
   useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) window.clearTimeout(pollTimerRef.current);
+      pollTokenRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     const i = inn.trim();
     const d = dosage.trim();
     const f = form.trim();
@@ -141,15 +153,24 @@ const App: React.FC = () => {
       setRefError(null);
       try {
         const res = await getReferenceOptions(i, d, f);
-        setRefOptions(res.options || []);
+        if ((res as any).loading) {
+          setRefOptions([]);
+          setRefError("GRLS загружается… попробуйте ещё раз через несколько секунд");
+          return;
+        }
+        const opts = res.options || [];
+        setRefOptions(opts);
         if (!refTradeName && res.default_trade_name) {
           setRefTradeName(res.default_trade_name);
         }
-        if ((res.options || []).length === 0) {
+        if (opts.length === 0) {
           setRefManual(true);
+        } else if (refManual && !refManualValue) {
+          setRefManual(false);
         }
       } catch (e: any) {
-        setRefError(e?.message || "Не удалось загрузить референты");
+        const msg = e?.message || "Не удалось загрузить референты";
+        setRefError(msg === "timeout" ? "Не удалось загрузить GRLS: превышено время ответа" : msg);
         setRefOptions([]);
       } finally {
         setRefLoading(false);
@@ -157,7 +178,7 @@ const App: React.FC = () => {
     }, 500);
 
     return () => window.clearTimeout(t);
-  }, [inn, dosage, form, refTradeName]);
+  }, [inn, dosage, form, refTradeName, refManual, refManualValue]);
 
   useEffect(() => {
     const q = grlsQuery.trim();
@@ -234,15 +255,30 @@ const App: React.FC = () => {
     return `${inn}${d} • ${regimen}`;
   }, [inn, dosage, regimen]);
 
+  const hasArtifacts = (res: any) => {
+    if (!res || typeof res !== "object") return false;
+    if (res.docxId || res.docx_id) return true;
+    const f = res.files;
+    return !!(f && (f.docx || f.pdf || f.md || f.yaml || f.json));
+  };
+
   const runDesign = async (e?: React.FormEvent) => {
     e?.preventDefault?.();
     if (!inn.trim()) return;
 
     setLoading(true);
     setParserError(null);
+    if (pollTimerRef.current) window.clearTimeout(pollTimerRef.current);
+    const token =
+      (crypto as any)?.randomUUID?.() ??
+      String(Date.now());
+    pollTokenRef.current = token;
+
     setJobId(null);
     setJobStage(null);
     setJobMessage(null);
+    setDraftReady(false);
+    draftReadyRef.current = false;
 
     try {
       const asyncStart = await designProtocolAsync({
@@ -263,41 +299,71 @@ const App: React.FC = () => {
       });
       setJobId(asyncStart.jobId);
 
+      let timeoutGraceTries = 0;
+
       const poll = async () => {
         if (!asyncStart.jobId) return;
-        const job = await getJobStatus(asyncStart.jobId);
-        setJobStage(job.stage || null);
-        setJobMessage(job.message || null);
-        const result = job.result || null;
-        if (result) {
-          setSynopsis(result?.synopsis || null);
-          setRagData(result?.rag || null);
-          setRagSummary(result?.ragSummary || null);
-          setDecision(result?.decision || null);
-          setStats(result?.stats || null);
-          setTimeline(result?.timeline || null);
-          if (result?.docxId) setDocxId(result.docxId);
-          else if (result?.docx_id) setDocxId(result.docx_id);
-          if (result?.files) setFiles(result.files);
-          else setFiles(null);
+        if (pollTokenRef.current !== token) return;
+        try {
+          const job = await getJobStatus(asyncStart.jobId);
+          setJobStage(job.stage || null);
+          setJobMessage(job.message || null);
+
+          const result = job.result || null;
+          const artifactsReady = Boolean(job.artifacts_ready) || hasArtifacts(result);
+
+          if (result) {
+            setSynopsis(result?.synopsis || null);
+            setRagData(result?.rag || null);
+            setRagSummary(result?.ragSummary || null);
+            setDecision(result?.decision || null);
+            setStats(result?.stats || null);
+            setTimeline(result?.timeline || null);
+            const newDocx = result?.docxId || result?.docx_id || null;
+            if (newDocx) setDocxId(newDocx);
+            setFiles(result?.files || null);
+          }
+
+          if (artifactsReady && !draftReadyRef.current) {
+            draftReadyRef.current = true;
+            setDraftReady(true);
+            setLoading(false);
+            showToast("ok", "Черновик готов — идёт поиск источников");
+          }
+
+          if (job.status === "done") {
+            setRightTab("synopsis");
+            setLoading(false);
+            showToast("ok", "Синопсис обновлён");
+            return;
+          }
+
+          if (job.status === "error") {
+            const msg = job.message || "Обогащение прервано";
+            const isTimeout = msg === "timeout" || job.error === "JOB_TIMEOUT";
+            if (isTimeout && !artifactsReady && timeoutGraceTries < 8) {
+              timeoutGraceTries += 1;
+              pollTimerRef.current = window.setTimeout(poll, 1500);
+              return;
+            }
+            if (artifactsReady) {
+              setLoading(false);
+              showToast("err", `${msg} (файлы сохранены)`);
+              return;
+            }
+            setParserError(msg);
+            setLoading(false);
+            showToast("err", msg);
+            return;
+          }
+
+          pollTimerRef.current = window.setTimeout(poll, 2000);
+        } catch (e) {
+          pollTimerRef.current = window.setTimeout(poll, 2000);
         }
-        if (job.status === "done") {
-          setRightTab("synopsis");
-          setLoading(false);
-          showToast("ok", "Синопсис обновлён");
-          return;
-        }
-        if (job.status === "error") {
-          const msg = job.message || "Ошибка проектирования";
-          setParserError(msg);
-          setLoading(false);
-          showToast("err", msg);
-          return;
-        }
-        window.setTimeout(poll, 2000);
       };
 
-      window.setTimeout(poll, 1000);
+      pollTimerRef.current = window.setTimeout(poll, 800);
     } catch (err: any) {
       const msg = err?.message || "Ошибка проектирования";
       setParserError(msg);
@@ -343,7 +409,7 @@ const App: React.FC = () => {
 
   const openUrl = (path?: string) => {
     if (!path) return;
-    window.open(path, "_blank", "noopener,noreferrer");
+    window.open(apiUrl(path), "_blank", "noopener,noreferrer");
   };
 
   const downloadDocx = () => {
