@@ -48,7 +48,7 @@ def _is_pdf_url(url: str) -> bool:
     return u.endswith(".pdf") or ".pdf?" in u or "filetype=pdf" in u
 
 
-def _fetch_html_text(url: str, timeout_s: float = 18.0) -> str:
+def _fetch_html_text(url: str, timeout_s: Optional[float] = 180.0) -> str:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -81,7 +81,15 @@ def _extract_cv_candidates(text: str) -> Dict[str, List[Tuple[float, str]]]:
             "cmax",
         ),
         (
+            r"(?:cv|coefficient of variation).{0,40}(cmax).{0,40}([0-9]{1,2}(?:\.[0-9]+)?)\s*%",
+            "cmax",
+        ),
+        (
             r"(auc0[-\s]?t|auc0[-\s]?inf|auc).{0,40}(?:cv|coefficient of variation|within[-\s]?subject cv|intra[-\s]?subject cv).{0,40}([0-9]{1,2}(?:\.[0-9]+)?)\s*%",
+            "auc",
+        ),
+        (
+            r"(?:cv|coefficient of variation).{0,40}(auc0[-\s]?t|auc0[-\s]?inf|auc).{0,40}([0-9]{1,2}(?:\.[0-9]+)?)\s*%",
             "auc",
         ),
         (
@@ -105,6 +113,23 @@ def _extract_cv_candidates(text: str) -> Dict[str, List[Tuple[float, str]]]:
             else:
                 out["cmax"].append((v, _clip(ctx, 220)))
 
+    return out
+
+
+def _extract_dois(text: str, limit: int = 6) -> List[str]:
+    if not text:
+        return []
+    hits = re.findall(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", text, flags=re.IGNORECASE)
+    out = []
+    seen = set()
+    for h in hits:
+        doi = h.rstrip(".,;)")
+        if doi.lower() in seen:
+            continue
+        seen.add(doi.lower())
+        out.append(doi)
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -149,7 +174,8 @@ class BEMiner:
         p.write_text(json.dumps(simp, ensure_ascii=False, indent=2), encoding="utf-8")
         return simp
 
-    def mine(self, inn: str, dosage: str, regimen: str, deadline_ts: float | None = None) -> Dict[str, Any]:
+    def mine(self, inn: str, dosage: str, regimen: str, deadline_ts: float | None = None, deep_mode: bool = False) -> Dict[str, Any]:
+        raw_limit = int(os.getenv("RAG_TEXT_CHARS", "20000"))
         def time_left() -> float:
             if deadline_ts is None:
                 return 9999.0
@@ -163,9 +189,12 @@ class BEMiner:
             f"{inn} {dosage} bioequivalence intra-subject variability coefficient of variation",
             f"{inn} {dosage} bioequivalence ANOVA within-subject variance Cmax AUC",
             f"{inn} {dosage} pharmacokinetics bioequivalence healthy volunteers Cmax AUC",
+            f"site:pubmed.ncbi.nlm.nih.gov {inn} {dosage} bioequivalence Cmax AUC",
+            f"site:scholar.google.com {inn} {dosage} bioequivalence Cmax AUC",
         ]
 
         excerpts: List[Dict[str, Any]] = []
+        raw_hits: List[Dict[str, Any]] = []
         evidence_docs: List[Dict[str, Any]] = []
         html_docs: List[Dict[str, Any]] = []
         candidate_docs: List[Dict[str, Any]] = []
@@ -197,7 +226,9 @@ class BEMiner:
 
                 raw = (r.get("raw") or r.get("raw_content") or r.get("content") or "").strip()
                 if raw:
-                    excerpts.append({"title": title, "uri": url, "text": _clip(raw, 8000)})
+                    hit = {"title": title, "uri": url, "text": _clip(raw, raw_limit)}
+                    excerpts.append(hit)
+                    raw_hits.append(hit)
 
                 if _is_pdf_url(url) and len(evidence_docs) < max_pdf and time_left() > 6.0:
                     try:
@@ -216,8 +247,11 @@ class BEMiner:
                                 "washout",
                                 "subjects",
                             ],
+                            allow_ocr=deep_mode,
                         )
-                        excerpts.append({"title": title, "uri": url, "text": _clip(parsed.relevant_md, 12000)})
+                        hit = {"title": title, "uri": url, "text": _clip(parsed.relevant_md, raw_limit)}
+                        excerpts.append(hit)
+                        raw_hits.append(hit)
                         evidence_docs.append({"title": title, "uri": url, "sha256": parsed.sha256})
                     except Exception:
                         continue
@@ -225,13 +259,15 @@ class BEMiner:
 
                 if len(html_docs) < max_html and not _is_pdf_url(url) and time_left() > 4.0:
                     try:
-                        txt = _fetch_html_text(url, timeout_s=10.0)
+                        txt = _fetch_html_text(url, timeout_s=180.0)
                         low = txt.lower()
                         if "cv" not in low and "coefficient of variation" not in low and "вариаб" not in low:
                             continue
                         if "cmax" not in low and "auc" not in low:
                             continue
-                        excerpts.append({"title": title, "uri": url, "text": _clip(txt, 12000)})
+                        hit = {"title": title, "uri": url, "text": _clip(txt, raw_limit)}
+                        excerpts.append(hit)
+                        raw_hits.append(hit)
                         html_docs.append({"title": title, "uri": url})
                     except Exception:
                         continue
@@ -241,6 +277,7 @@ class BEMiner:
 
         all_text = "\n\n".join([e["text"] for e in excerpts[:6]])
         cands = _extract_cv_candidates(all_text)
+        dois = _extract_dois(all_text)
 
         cmax_guess = max([v for v, _ in cands["cmax"]], default=None)
         auc_guess = max([v for v, _ in cands["auc"]], default=None)
@@ -255,7 +292,15 @@ class BEMiner:
             "evidence": [],
             "typical": {},
             "notes": "CV извлечён из BE источников (PDF/HTML).",
+            "queries": queries,
+            "dois": dois,
+            "raw_hits": raw_hits[:10],
         }
+
+        if not result["evidence_docs"]:
+            result["evidence_docs"] = [{"title": f"Search: {q}", "uri": f"search://{_sha(q)[:12]}"} for q in queries[:3]]
+        if not result["discovered"]:
+            result["discovered"] = [{"title": f"Search: {q}", "uri": f"search://{_sha(q)[:12]}", "kind": "be_query"} for q in queries[:3]]
 
         if self.model and excerpts and (result["cvintra"]["cmax"] is None or result["cvintra"]["auc"] is None) and time_left() > 6.0:
             pack = "\n\n".join([f"=== {e['title']} ({e['uri']}) ===\n{e['text']}" for e in excerpts[:4]])

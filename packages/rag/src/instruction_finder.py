@@ -82,13 +82,16 @@ class InstructionFinder:
         dosage_form: str,
         deadline_ts: float | None = None,
         source_path: str | None = None,
+        deep_mode: bool = False,
     ) -> Dict[str, Any]:
+        raw_limit = int(os.getenv("RAG_TEXT_CHARS", "20000"))
         def time_left() -> float:
             if deadline_ts is None:
                 return 9999.0
             return deadline_ts - time.time()
 
         evidence_docs: List[Dict[str, str]] = []
+        raw_hits: List[Dict[str, str]] = []
         best_doc: Optional[InstructionDoc] = None
 
         if source_path and time_left() > 2.0:
@@ -108,6 +111,7 @@ class InstructionFinder:
                         "within-subject",
                         "cv",
                     ],
+                    allow_ocr=deep_mode,
                 )
                 best_doc = InstructionDoc(
                     title=parsed.title,
@@ -121,12 +125,14 @@ class InstructionFinder:
 
         tn = (trade_name or "").strip()
         if not tn:
-            return {"doc": best_doc, "evidence_docs": self._dedupe_docs(evidence_docs)}
+            return {"doc": best_doc, "evidence_docs": self._dedupe_docs(evidence_docs), "queries": [], "raw_hits": raw_hits}
 
         queries = [
             f"\"{tn}\" {dosage} {dosage_form} инструкция pdf",
             f"\"{tn}\" \"инструкция по медицинскому применению\" filetype:pdf",
             f"\"{tn}\" {dosage} mg SmPC pdf",
+            f"site:grls.rosminzdrav.ru \"{tn}\" инструкция",
+            f"site:ema.europa.eu {tn} SmPC pdf",
         ]
 
         for q in queries:
@@ -142,6 +148,8 @@ class InstructionFinder:
 
                 raw = ((r.get("raw") or "") + "\n" + (r.get("content") or "")).strip()
                 raw_low = raw.lower()
+                if raw:
+                    raw_hits.append({"title": title, "uri": url, "text": _clip(raw, raw_limit)})
                 if raw and any(
                     k in raw_low
                     for k in [
@@ -155,7 +163,7 @@ class InstructionFinder:
                     best_doc = InstructionDoc(
                         title=title,
                         url=url,
-                        relevant_md=_clip(raw, 12000),
+                        relevant_md=_clip(raw, raw_limit),
                         sha256=_sha(url + raw),
                     )
                     break
@@ -168,7 +176,7 @@ class InstructionFinder:
                 if not self._is_pdf_url(url):
                     continue
                 try:
-                    parsed = self.parser.parse(url, title=ed["title"], uri=url)
+                    parsed = self.parser.parse(url, title=ed["title"], uri=url, allow_ocr=deep_mode)
                     best_doc = InstructionDoc(
                         title=parsed.title,
                         url=url,
@@ -179,4 +187,9 @@ class InstructionFinder:
                 except Exception:
                     continue
 
-        return {"doc": best_doc, "evidence_docs": self._dedupe_docs(evidence_docs)}
+        return {
+            "doc": best_doc,
+            "evidence_docs": self._dedupe_docs(evidence_docs),
+            "queries": queries,
+            "raw_hits": raw_hits[:6],
+        }

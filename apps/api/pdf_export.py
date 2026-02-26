@@ -180,11 +180,15 @@ def make_synopsis_pdf(
     p(synopsis.get("safetyAnalysis", ""))
     p(synopsis.get("ethicalAspects", ""))
 
+    if synopsis.get("evidenceSummary"):
+        section("Источники и обоснование")
+        p(synopsis.get("evidenceSummary", ""))
+
     bib = synopsis.get("bibliography") if isinstance(synopsis.get("bibliography"), list) else []
     if bib:
         section("Источники")
         items = []
-        for b in bib[:20]:
+        for b in bib:
             if isinstance(b, dict):
                 title = (b.get("title") or "").strip()
                 uri = (b.get("uri") or "").strip()

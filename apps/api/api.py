@@ -62,7 +62,7 @@ def _warmup_grls() -> None:
 
 DB_PATH = os.getenv("DB_PATH", "data/app.db")
 ARTIFACT_DIR = Path(os.getenv("ARTIFACT_DIR", "data/artifacts"))
-RAG_TIMEOUT_S = float(os.getenv("RAG_TIMEOUT_S", "25"))
+RAG_TIMEOUT_S = float(os.getenv("RAG_TIMEOUT_S", "120"))
 
 
 
@@ -355,6 +355,7 @@ def _run_design_pipeline(
     refTradeName: str,
     mode: str,
     file_path: str | None,
+    deep_mode: bool = False,
     progress_cb: Callable[[str, float, str, dict | None], None] | None = None,
 ) -> dict:
     def _emit(stage: str, progress: float, message: str, payload: dict | None = None) -> None:
@@ -364,7 +365,8 @@ def _run_design_pipeline(
     folder_id, auth_key = _get_yandex_keys(optional=True)
 
     cv_manual = cvIntra.strip().lower() not in ("", "auto")
-    skip_be = cv_manual
+    # always run BE search for evidence, but keep manual CV as priority
+    skip_be = False
     skip_instruction = cv_manual and os.getenv("RAG_SKIP_INSTRUCTION_ON_MANUAL_CV", "1") == "1"
 
     cv_intra_input = normalize_cv(cvIntra)
@@ -471,10 +473,8 @@ def _run_design_pipeline(
     if mode != "enrich":
         return draft_payload
 
-    rag_timeout_s = float(os.getenv("RAG_TIMEOUT_S", "25"))
-    if rag_timeout_s > 120:
-        rag_timeout_s = 120
-    deadline_ts = time.time() + rag_timeout_s
+    # no hard time limit: let enrichment complete
+    deadline_ts = None
     try:
         tavily_key = _get_tavily_key()
     except HTTPException:
@@ -486,35 +486,72 @@ def _run_design_pipeline(
 
     collector = DrugDataCollector(tavily_key=tavily_key)
     _emit("discover", 0.5, "Поиск источников")
-    rag_enriched = _run_with_timeout(
-        lambda: collector.get_drug_info(
-            drug_inn=inn,
-            dosage=dosage,
-            dosage_form=form,
-            regimen=regimen,
-            reference_trade_name=refTradeName or None,
-            skip_be=skip_be,
-            skip_instruction=skip_instruction,
-            deadline_ts=deadline_ts,
-            source_path=file_path,
-        ),
-        timeout_s=rag_timeout_s,
-        fallback=rag_result,
+    rag_enriched = collector.get_drug_info(
+        drug_inn=inn,
+        dosage=dosage,
+        dosage_form=form,
+        regimen=regimen,
+        reference_trade_name=refTradeName or None,
+        skip_be=skip_be,
+        skip_instruction=skip_instruction,
+        deadline_ts=deadline_ts,
+        source_path=file_path,
+        deep_mode=deep_mode,
+        progress_cb=progress_cb,
     )
     if rag_enriched is rag_result:
         rag_enriched.setdefault("notes", {})
         rag_enriched["notes"]["rag_error"] = "rag_timeout_or_error"
+        # ensure evidence + sources even on timeout
+        rag_enriched.setdefault("evidence_docs", [])
+        if not rag_enriched["evidence_docs"]:
+            rag_enriched["evidence_docs"].extend(_quick_sources(inn, dosage, regimen))
+        rag_enriched.setdefault("evidence", [])
+        if not rag_enriched["evidence"]:
+            for ev in rag_enriched["evidence_docs"][:5]:
+                if isinstance(ev, dict):
+                    rag_enriched["evidence"].append(
+                        {
+                            "title": ev.get("title", "Source"),
+                            "uri": ev.get("uri", ""),
+                            "used_for": ["evidence_doc"],
+                            "quote": "",
+                        }
+                    )
 
     rag_summary = summarize_rag(rag_enriched)
     if not rag_enriched.get("evidence_docs"):
         rag_enriched.setdefault("evidence_docs", [])
         rag_enriched["evidence_docs"].extend(_quick_sources(inn, dosage, regimen))
+    if not rag_enriched.get("evidence"):
+        rag_enriched.setdefault("evidence", [])
+        for ev in rag_enriched["evidence_docs"][:5]:
+            if isinstance(ev, dict):
+                rag_enriched["evidence"].append(
+                    {"title": ev.get("title", "Source"), "uri": ev.get("uri", ""), "used_for": ["evidence_doc"], "quote": ""}
+                )
 
     cv_intra_auto = None
+    # 1) ragSummary (preferred)
     if rag_summary.get("cvintra_cmax") is not None:
         cv_intra_auto = normalize_cv(rag_summary.get("cvintra_cmax"))
     if rag_summary.get("cvintra_auc") is not None:
         cv_intra_auto = max(cv_intra_auto or 0, normalize_cv(rag_summary.get("cvintra_auc")) or 0)
+    # 2) fallback: rag.cvintra or be.cvintra (if summarize_rag missed)
+    if cv_intra_auto is None:
+        raw_cv = (rag_enriched.get("cvintra") or {})
+        if isinstance(raw_cv, dict):
+            for key in ("cmax", "auc"):
+                val = normalize_cv(raw_cv.get(key))
+                if val is not None:
+                    cv_intra_auto = max(cv_intra_auto or 0, val)
+    if cv_intra_auto is None:
+        be_cv = (rag_enriched.get("be") or {}).get("cvintra") or {}
+        if isinstance(be_cv, dict):
+            for key in ("cmax", "auc"):
+                val = normalize_cv(be_cv.get(key))
+                if val is not None:
+                    cv_intra_auto = max(cv_intra_auto or 0, val)
     if cv_intra_input is not None:
         cv_final = cv_intra_input
     elif cv_intra_auto is not None:
@@ -655,6 +692,7 @@ async def design(
     screenFail: str = Form("0"),
     refTradeName: str = Form(""),
     mode: str = Form("enrich"),
+    deepMode: str = Form("false"),
     file: UploadFile | None = File(None),
 ) -> dict:
     file_path = None
@@ -679,6 +717,7 @@ async def design(
             refTradeName=refTradeName,
             mode=mode if mode in ("fast", "enrich") else "enrich",
             file_path=file_path,
+            deep_mode=deepMode.lower() == "true",
             progress_cb=None,
         )
     finally:
@@ -704,6 +743,7 @@ async def design_async(
     screenFail: str = Form("0"),
     refTradeName: str = Form(""),
     mode: str = Form("fast"),
+    deepMode: str = Form("false"),
     file: UploadFile | None = File(None),
 ) -> dict:
     file_path = None
@@ -730,6 +770,7 @@ async def design_async(
                 refTradeName=refTradeName,
                 mode="fast",
                 file_path=file_path,
+                deep_mode=deepMode.lower() == "true",
                 progress_cb=update,
             )
         finally:
@@ -745,6 +786,61 @@ async def design_async(
 
 @app.post("/api/enrich-async")
 async def enrich_async(
+    inn: str = Form(...),
+    form: str = Form(...),
+    dosage: str = Form(...),
+    cvIntra: str = Form("auto"),
+    rsabe: str = Form("false"),
+    design: str = Form("auto"),
+    regimen: str = Form("Натощак"),
+    studyType: str = Form("Однофазное"),
+    constraints: str = Form(""),
+    dropOut: str = Form("0"),
+    screenFail: str = Form("0"),
+    refTradeName: str = Form(""),
+    deepMode: str = Form("false"),
+    file: UploadFile | None = File(None),
+) -> dict:
+    file_path = None
+    if file:
+        suffix = os.path.splitext(file.filename or "")[-1] or ".pdf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await file.read())
+            file_path = tmp.name
+
+    def pipeline(update):
+        try:
+            return _run_design_pipeline(
+                inn=inn,
+                form=form,
+                dosage=dosage,
+                cvIntra=cvIntra,
+                rsabe=rsabe,
+                design=design,
+                regimen=regimen,
+                studyType=studyType,
+                constraints=constraints,
+                dropOut=dropOut,
+                screenFail=screenFail,
+                refTradeName=refTradeName,
+                mode="enrich",
+                file_path=file_path,
+                deep_mode=deepMode.lower() == "true",
+                progress_cb=update,
+            )
+        finally:
+            if file_path:
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+
+    job = create_job("enrich", pipeline)
+    return {"jobId": job.id}
+
+
+@app.post("/api/deep-ocr-async")
+async def deep_ocr_async(
     inn: str = Form(...),
     form: str = Form(...),
     dosage: str = Form(...),
@@ -783,6 +879,7 @@ async def enrich_async(
                 refTradeName=refTradeName,
                 mode="enrich",
                 file_path=file_path,
+                deep_mode=True,
                 progress_cb=update,
             )
         finally:
@@ -792,7 +889,7 @@ async def enrich_async(
                 except OSError:
                     pass
 
-    job = create_job("enrich", pipeline)
+    job = create_job("deep-ocr", pipeline)
     return {"jobId": job.id}
 
 

@@ -116,6 +116,7 @@ import {
   DesignFiles,
   apiUrl,
   enrichProtocolAsync,
+  deepOcrProtocolAsync,
 } from "./services/apiService";
 
 const App: React.FC = () => {
@@ -132,6 +133,7 @@ const App: React.FC = () => {
   const [dropOut, setDropOut] = useState("20");
   const [screenFail, setScreenFail] = useState("10");
   const [parserFile, setParserFile] = useState<File | null>(null);
+  const [deepMode, setDeepMode] = useState(false);
   const [refTradeName, setRefTradeName] = useState("");
   const [refManual, setRefManual] = useState(false);
   const [refManualValue, setRefManualValue] = useState("");
@@ -375,11 +377,14 @@ const App: React.FC = () => {
   const progressSteps = [
     { key: "draft", label: "Draft" },
     { key: "discover", label: "Поиск литературы" },
+    { key: "instruction", label: "Инструкция/SmPC" },
+    { key: "be", label: "BE источники" },
+    { key: "llm", label: "LLM fallback" },
     { key: "synopsis", label: "Формирование синопсиса" },
     { key: "export", label: "Экспорт файлов" },
     { key: "done", label: "Готово" },
   ];
-  const stageOrder = ["queued", "draft", "discover", "synopsis", "export", "done", "error"];
+  const stageOrder = ["queued", "draft", "discover", "instruction", "be", "llm", "synopsis", "export", "done", "error"];
   const currentStageIndex = stageOrder.indexOf(jobStage || "");
 
   const runDesign = async (e?: React.FormEvent) => {
@@ -519,6 +524,7 @@ const App: React.FC = () => {
         dropOut,
         screenFail,
         refTradeName: refManual ? refManualValue : refTradeName,
+        deepMode,
         file: parserFile,
       });
 
@@ -591,6 +597,107 @@ const App: React.FC = () => {
       pollTimerRef.current = window.setTimeout(poll, 800);
     } catch (err: any) {
       const msg = err?.message || "Ошибка обогащения";
+      setParserError(msg);
+      showToast("err", msg);
+      setLoading(false);
+    }
+  };
+
+  const runDeepOcr = async () => {
+    if (!inn.trim()) return;
+    setLoading(true);
+    setParserError(null);
+
+    if (pollTimerRef.current) window.clearTimeout(pollTimerRef.current);
+    const token = (crypto as any)?.randomUUID?.() ?? String(Date.now());
+    pollTokenRef.current = token;
+
+    try {
+      const asyncStart = await deepOcrProtocolAsync({
+        inn,
+        form,
+        dosage,
+        cvIntra,
+        rsabe,
+        design,
+        regimen,
+        studyType,
+        constraints,
+        dropOut,
+        screenFail,
+        refTradeName: refManual ? refManualValue : refTradeName,
+        file: parserFile,
+      });
+
+      setJobId(asyncStart.jobId);
+
+      let timeoutGraceTries = 0;
+
+      const poll = async () => {
+        if (!asyncStart.jobId) return;
+        if (pollTokenRef.current !== token) return;
+        try {
+          const job = await getJobStatus(asyncStart.jobId);
+          setJobStage(job.stage || null);
+          setJobMessage(job.message || null);
+
+          const result = job.result || null;
+          const artifactsReady = Boolean(job.artifacts_ready) || hasArtifacts(result);
+
+          if (result) {
+            setSynopsis(result?.synopsis || null);
+            setRagData(result?.rag || null);
+            setRagSummary(result?.ragSummary || null);
+            setDecision(result?.decision || null);
+            setStats(result?.stats || null);
+            setTimeline(result?.timeline || null);
+            const newDocx = result?.docxId || result?.docx_id || null;
+            if (newDocx) setDocxId(newDocx);
+            setFiles(result?.files || null);
+          }
+
+          if (artifactsReady && !draftReadyRef.current) {
+            draftReadyRef.current = true;
+            setDraftReady(true);
+            setLoading(false);
+            showToast("ok", "Черновик готов — идёт Deep OCR");
+          }
+
+          if (job.status === "done") {
+            setRightTab("synopsis");
+            setLoading(false);
+            showToast("ok", "Deep OCR завершён");
+            return;
+          }
+
+          if (job.status === "error") {
+            const msg = job.message || "Deep OCR прерван";
+            const isTimeout = msg === "timeout" || job.error === "JOB_TIMEOUT";
+            if (isTimeout && !artifactsReady && timeoutGraceTries < 8) {
+              timeoutGraceTries += 1;
+              pollTimerRef.current = window.setTimeout(poll, 1500);
+              return;
+            }
+            if (artifactsReady) {
+              setLoading(false);
+              showToast("err", `${msg} (файлы сохранены)`);
+              return;
+            }
+            setParserError(msg);
+            setLoading(false);
+            showToast("err", msg);
+            return;
+          }
+
+          pollTimerRef.current = window.setTimeout(poll, 2000);
+        } catch (e) {
+          pollTimerRef.current = window.setTimeout(poll, 2000);
+        }
+      };
+
+      pollTimerRef.current = window.setTimeout(poll, 800);
+    } catch (err: any) {
+      const msg = err?.message || "Ошибка Deep OCR";
       setParserError(msg);
       showToast("err", msg);
       setLoading(false);
@@ -1426,6 +1533,15 @@ const App: React.FC = () => {
                       className="text-xs text-slate-600"
                     />
                   </div>
+                  <label className="mt-3 inline-flex items-center gap-2 text-xs font-semibold text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={deepMode}
+                      onChange={(e) => setDeepMode(e.target.checked)}
+                      className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                    />
+                    Deep OCR (медленно, для сканов)
+                  </label>
                 </div>
 
                 <div className="mt-3">
@@ -1463,6 +1579,14 @@ const App: React.FC = () => {
                   className="w-full rounded-3xl border border-emerald-200 text-emerald-700 py-3 font-bold text-sm hover:bg-emerald-50 transition-all disabled:opacity-40"
                 >
                   Обогатить источниками
+                </button>
+                <button
+                  type="button"
+                  disabled={loading || !inn.trim() || !synopsis}
+                  onClick={() => runDeepOcr()}
+                  className="w-full rounded-3xl border border-slate-200 text-slate-700 py-3 font-bold text-sm hover:bg-slate-50 transition-all disabled:opacity-40"
+                >
+                  Deep OCR (сканы)
                 </button>
               </div>
 
@@ -1944,6 +2068,41 @@ const App: React.FC = () => {
 
             {!loading && rightTab === "sources" && (
               <div className="space-y-3">
+                {Array.isArray(ragData?.search_queries) && ragData.search_queries.length > 0 && (
+                  <div className="rounded-3xl border border-slate-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-[0.22em] font-extrabold text-slate-500 mb-2">
+                      Поисковые запросы
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {ragData.search_queries.slice(0, 12).map((q: string, i: number) => (
+                        <span
+                          key={`${q}-${i}`}
+                          className="px-3 py-1.5 rounded-full bg-slate-100 text-slate-700 text-[11px] font-extrabold"
+                        >
+                          {q}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {Array.isArray(ragData?.be?.dois) && ragData.be.dois.length > 0 && (
+                  <div className="rounded-3xl border border-slate-200 bg-white p-4">
+                    <div className="text-[11px] uppercase tracking-[0.22em] font-extrabold text-slate-500 mb-2">
+                      DOI (из источников)
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {ragData.be.dois.slice(0, 8).map((d: string, i: number) => (
+                        <span
+                          key={`${d}-${i}`}
+                          className="px-3 py-1.5 rounded-full bg-slate-100 text-slate-700 text-[11px] font-extrabold"
+                        >
+                          {d}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 {Array.isArray(synopsis?.bibliography) && synopsis!.bibliography.length > 0 ? (
                   synopsis!.bibliography.slice(0, 40).map((b: any, i: number) => (
                     <div

@@ -126,12 +126,14 @@ def build_synopsis_docx(
 
     add_row("Безопасность:", str(synopsis.get("safetyAnalysis") or ""))
     add_row("Этические аспекты:", str(synopsis.get("ethicalAspects") or ""))
+    if synopsis.get("evidenceSummary"):
+        add_row("Источники и обоснование:", str(synopsis.get("evidenceSummary") or ""))
     add_row("Дата версии:", str(synopsis.get("versionDate") or ""))
 
     bib = synopsis.get("bibliography") if isinstance(synopsis.get("bibliography"), list) else []
     if bib:
         items = []
-        for b in bib[:20]:
+        for b in bib:
             if isinstance(b, dict):
                 t = (b.get("title") or "").strip()
                 u = (b.get("uri") or "").strip()

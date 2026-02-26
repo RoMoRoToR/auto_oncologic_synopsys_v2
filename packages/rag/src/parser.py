@@ -8,9 +8,13 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import requests
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-PDF_TIMEOUT_S = float(os.getenv("PDF_TIMEOUT_S", "18"))
+_pdf_timeout_env = os.getenv("PDF_TIMEOUT_S", "")
+PDF_TIMEOUT_S = float(_pdf_timeout_env) if _pdf_timeout_env else 180.0
 MAX_PDF_MB = int(os.getenv("MAX_PDF_MB", "30"))
+DOCLING_ENABLED = os.getenv("DOCLING_ENABLED", "0") == "1"
+DOCLING_TIMEOUT_S = float(os.getenv("DOCLING_TIMEOUT_S", "12"))
 
 try:
     from pypdf import PdfReader
@@ -124,7 +128,34 @@ class PDFParser:
             chunks.append(text[start:end].strip())
         return "\n\n".join([f"### EXCERPT {i+1}\n{c}" for i, c in enumerate(chunks)])
 
-    def parse(self, source: str, title: str = "", uri: str = "", keywords: Optional[List[str]] = None) -> ParsedDoc:
+    def _convert_docling(self, pdf_path: str) -> str:
+        try:
+            from docling.document_converter import DocumentConverter  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"docling_not_available: {e}")
+        converter = DocumentConverter()
+        result = converter.convert(pdf_path)
+        md = result.document.export_to_markdown()
+        md = (md or "").replace("\r\n", "\n").replace("\r", "\n")
+        md = re.sub(r"\n{4,}", "\n\n\n", md)
+        return md.strip()
+
+    def _convert_docling_with_timeout(self, pdf_path: str, timeout_s: float) -> str:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(self._convert_docling, pdf_path)
+            try:
+                return fut.result(timeout=timeout_s)
+            except TimeoutError:
+                raise TimeoutError(f"docling_timeout_{timeout_s}s")
+
+    def parse(
+        self,
+        source: str,
+        title: str = "",
+        uri: str = "",
+        keywords: Optional[List[str]] = None,
+        allow_ocr: bool = False,
+    ) -> ParsedDoc:
         if os.path.exists(source):
             data = Path(source).read_bytes()
             sha = self._sha256_bytes(data)
@@ -140,6 +171,11 @@ class PDFParser:
         else:
             txt = self._extract_text_fast(str(pdf_path))
             md = (txt or "").strip()
+            if not md and allow_ocr and DOCLING_ENABLED:
+                try:
+                    md = self._convert_docling_with_timeout(str(pdf_path), DOCLING_TIMEOUT_S)
+                except Exception:
+                    md = ""
             md_path.write_text(md, encoding="utf-8")
 
         if rel_path.exists():
@@ -157,8 +193,8 @@ class PDFParser:
             sha256=sha,
         )
 
-    def to_markdown(self, source: str) -> str:
-        return self.parse(source).content_md
+    def to_markdown(self, source: str, allow_ocr: bool = False) -> str:
+        return self.parse(source, allow_ocr=allow_ocr).content_md
 
-    def to_relevant_markdown(self, source: str, keywords: Optional[List[str]] = None) -> str:
-        return self.parse(source, keywords=keywords).relevant_md
+    def to_relevant_markdown(self, source: str, keywords: Optional[List[str]] = None, allow_ocr: bool = False) -> str:
+        return self.parse(source, keywords=keywords, allow_ocr=allow_ocr).relevant_md

@@ -41,6 +41,36 @@ def _find_first(patterns: List[str], text: str) -> Optional[Tuple[float, str, st
     return None
 
 
+def _extract_relevant(text: str, keywords: Optional[List[str]] = None, window: int = 700, max_chunks: int = 12, fallback_chars: int = 12000) -> str:
+    if not text:
+        return ""
+    kws = [k.lower() for k in (keywords or [
+        "tmax", "t1/2", "half-life", "cmax", "auc", "within-subject", "intra-subject", "cv",
+        "период полувыведения", "время достижения максимальной концентрации", "коэффициент вариации",
+    ])]
+    low = text.lower()
+    hits: List[int] = []
+    for kw in kws:
+        for m in re.finditer(re.escape(kw), low):
+            hits.append(m.start())
+    if not hits:
+        return text[:fallback_chars]
+
+    hits = sorted(set(hits))
+    chunks: List[str] = []
+    used: List[Tuple[int, int]] = []
+    for pos in hits:
+        if len(chunks) >= max_chunks:
+            break
+        start = max(0, pos - window)
+        end = min(len(text), pos + window)
+        rng = (start, end)
+        if any(not (rng[1] <= r[0] or r[1] <= rng[0]) for r in used):
+            continue
+        used.append(rng)
+        chunks.append(text[start:end].strip())
+    return "\n\n".join([f"### EXCERPT {i+1}\n{c}" for i, c in enumerate(chunks)])
+
 class LabelExtractor:
     """
     Из инструкции достаём Tmax и T1/2 (с regex, при необходимости fallback на LLM).
@@ -119,4 +149,137 @@ class LabelExtractor:
                 if out["pk"]["t12_h"] is None and pk.get("t12_h") is not None:
                     out["pk"]["t12_h"] = pk.get("t12_h")
 
+        return out
+
+    def extract_from_texts(self, items: List[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        LLM fallback from multiple raw snippets (Tavily/HTML).
+        items: [{title, uri, text}]
+        """
+        chunks = []
+        for i in items[:4]:
+            raw = i.get("text", "")
+            rel = _extract_relevant(raw)
+            chunks.append(f"=== {i.get('title','')} ({i.get('uri','')}) ===\n{rel}")
+        text = "\n\n".join(chunks)
+
+        out = {
+            "pk": {"tmax_h": None, "t12_h": None},
+            "cvintra": {"cmax": None, "auc": None},
+            "from_instruction": False,
+            "evidence": [],
+        }
+
+        if not self.model or not text.strip():
+            return out
+
+        prompt = f"""
+Ты извлекаешь PK из фрагментов источников. Ничего не выдумывай.
+Верни СТРОГО JSON:
+{{
+  "pk": {{"tmax_h": 4.0, "t12_h": 19.0}},
+  "evidence": [{{"title":"...","uri":"...","quote":"<=25 words","used_for":["pk.tmax_h"]}}]
+}}
+Если значения не найдены — null.
+Текст:
+{text[:35000]}
+"""
+        res = self.model.run(prompt)
+        raw = res.alternatives[0].text if res and res.alternatives else ""
+        parsed = extract_json(raw) or {}
+        if isinstance(parsed, dict):
+            pk = parsed.get("pk")
+            if isinstance(pk, dict):
+                out["pk"]["tmax_h"] = pk.get("tmax_h")
+                out["pk"]["t12_h"] = pk.get("t12_h")
+            if isinstance(parsed.get("evidence"), list):
+                out["evidence"] = parsed.get("evidence")
+        return out
+
+    def extract_pk_cv_from_texts(self, items: List[Dict[str, str]], sources: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+        """
+        LLM fallback for PK + CV from multiple raw snippets.
+        items: [{title, uri, text}]
+        """
+        chunks = []
+        for i in items[:6]:
+            raw = i.get("text", "")
+            rel = _extract_relevant(raw)
+            chunks.append(f"=== {i.get('title','')} ({i.get('uri','')}) ===\n{rel}")
+        text = "\n\n".join(chunks)
+
+        out = {
+            "pk": {"tmax_h": None, "t12_h": None},
+            "cvintra": {"cmax": None, "auc": None},
+            "evidence": [],
+            "filled_by_llm": False,
+            "used_sources": [],
+        }
+
+        if not self.model or not text.strip():
+            return out
+
+        src_lines = []
+        for s in (sources or [])[:20]:
+            title = (s.get("title") or "").strip()
+            uri = (s.get("uri") or "").strip()
+            if title or uri:
+                src_lines.append(f"- {title} — {uri}")
+
+        prompt = f"""
+Ты извлекаешь PK и CV из фрагментов источников. Ничего не выдумывай.
+Верни СТРОГО JSON:
+{{
+  "pk": {{"tmax_h": 4.0, "t12_h": 19.0}},
+  "cvintra": {{"cmax": 0.24, "auc": 0.18}},
+  "evidence": [{{"title":"...","uri":"...","quote":"<=25 words","used_for":["pk.tmax_h"]}}]
+}}
+Если значения не найдены — null.
+Список источников (для ссылок в evidence):
+{chr(10).join(src_lines)}
+Текст:
+{text[:42000]}
+"""
+        res = self.model.run(prompt)
+        raw = res.alternatives[0].text if res and res.alternatives else ""
+        parsed = extract_json(raw) or {}
+        if isinstance(parsed, dict):
+            pk = parsed.get("pk")
+            if isinstance(pk, dict):
+                out["pk"]["tmax_h"] = pk.get("tmax_h")
+                out["pk"]["t12_h"] = pk.get("t12_h")
+            cv = parsed.get("cvintra")
+            if isinstance(cv, dict):
+                out["cvintra"]["cmax"] = cv.get("cmax")
+                out["cvintra"]["auc"] = cv.get("auc")
+            if isinstance(parsed.get("evidence"), list):
+                out["evidence"] = parsed.get("evidence")
+
+        has_quote = False
+        used_sources = set()
+        for ev in out.get("evidence", []):
+            if not isinstance(ev, dict):
+                continue
+            quote = (ev.get("quote") or "").strip()
+            if quote:
+                has_quote = True
+            uri = (ev.get("uri") or "").strip()
+            if uri:
+                used_sources.add(uri)
+
+        # allow fill even without quotes, but mark quality
+        out["filled_by_llm"] = True
+        out["used_sources"] = sorted(used_sources)
+        if not has_quote:
+            out["llm_quality"] = "no_quotes"
+            if not out.get("evidence") and sources:
+                for s in sources[:5]:
+                    out["evidence"].append(
+                        {
+                            "title": s.get("title", "Source"),
+                            "uri": s.get("uri", ""),
+                            "used_for": ["llm_fallback"],
+                            "quote": "",
+                        }
+                    )
         return out

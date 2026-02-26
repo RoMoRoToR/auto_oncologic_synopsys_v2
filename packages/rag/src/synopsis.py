@@ -151,10 +151,15 @@ def _to_markdown(s: Dict[str, Any]) -> str:
     md.append(para(s.get("safetyAnalysis", "")))
     md.append(para(s.get("ethicalAspects", "")))
 
+    ev = (s.get("evidenceSummary") or "").strip()
+    if ev:
+        md.append(h2("Источники и обоснование"))
+        md.append(para(ev))
+
     bib = s.get("bibliography") if isinstance(s.get("bibliography"), list) else []
     if bib:
         md.append(h2("Источники"))
-        for b in bib[:20]:
+        for b in bib:
             if isinstance(b, dict):
                 title = (b.get("title") or "").strip()
                 uri = (b.get("uri") or "").strip()
@@ -186,6 +191,7 @@ class YandexSynopsisGenerator:
         "pkParameters",
         "beCriteria",
         "versionDate",
+        "evidenceSummary",
     }
 
     def __init__(self, folder_id: str | None = None, auth_key: str | None = None):
@@ -202,13 +208,31 @@ class YandexSynopsisGenerator:
     ) -> Dict[str, Any]:
         base = self._build_base(params, rag_context or {})
 
+        llm_only = os.getenv("SYNOPSIS_LLM_ONLY", "0") == "1"
+
         if use_llm is None:
             use_llm = (self.model is not None) and (os.getenv("SYNOPSIS_USE_LLM", "1") == "1")
+        if llm_only and self.model is not None:
+            use_llm = True
 
         if use_llm and self.model is not None:
             try:
-                edited = self._llm_polish(base, rag_context or {})
-                merged = self._merge_locked(base, edited)
+                ev = self._llm_evidence_summary(base, rag_context or {})
+                if ev:
+                    base["evidenceSummary"] = ev
+            except Exception:
+                pass
+
+        if use_llm and self.model is not None:
+            try:
+                if llm_only:
+                    filled_all = self._llm_full_fill(base, rag_context or {})
+                    merged = self._merge_locked(base, filled_all)
+                else:
+                    filled = self._llm_fill_missing(base, rag_context or {})
+                    base = self._merge_missing(base, filled)
+                    edited = self._llm_polish(base, rag_context or {})
+                    merged = self._merge_locked(base, edited)
             except Exception:
                 merged = base
         else:
@@ -240,6 +264,7 @@ class YandexSynopsisGenerator:
         timeline = rag_ctx.get("timeline") or {}
         rag_summary = rag_ctx.get("ragSummary") or {}
         rag = rag_ctx.get("rag") or {}
+        warnings = rag.get("warnings") if isinstance(rag.get("warnings"), list) else []
 
         code = _make_code(inn)
         today = date.today().isoformat()
@@ -327,8 +352,11 @@ class YandexSynopsisGenerator:
         dose_str = dosage if dosage else "—"
         dose_form = f"{form}, {dose_str} мг".strip().strip(",")
 
+        ref_info = rag.get("reference") or {}
+        ref_trade = _safe_str(ref_info.get("trade_name"))
+        ref_name = ref_trade or inn or "референтного препарата"
         test_reg = f"Однократный приём тестируемого препарата {dose_str} мг {regimen.lower() if regimen else ''} с {water_ml} мл воды."
-        ref_reg = f"Однократный приём референтного препарата {dose_str} мг {regimen.lower() if regimen else ''} с {water_ml} мл воды."
+        ref_reg = f"Однократный приём референтного препарата {ref_name} {dose_str} мг {regimen.lower() if regimen else ''} с {water_ml} мл воды."
 
         pk_params = "Cmax, AUC0-t, AUC0-∞ (при наличии), Tmax (описательно)"
         be_criteria = "90% ДИ для отношения геометрических средних (T/R) по ln(Cmax) и ln(AUC0-t) в пределах 80.00–125.00%."
@@ -382,12 +410,35 @@ class YandexSynopsisGenerator:
         if isinstance(label, dict) and (label.get("title") or label.get("url")):
             add_source(_safe_str(label.get("title")), _safe_str(label.get("url")), "instruction", "")
 
-        if not bibliography and isinstance(rag.get("evidence_docs"), list):
-            for ev in rag["evidence_docs"][:20]:
+        if isinstance(rag.get("evidence_docs"), list):
+            for ev in rag["evidence_docs"]:
                 if isinstance(ev, dict):
                     add_source(_safe_str(ev.get("title")), _safe_str(ev.get("uri")), "evidence_doc", "")
 
+        if isinstance(rag.get("search_queries"), list):
+            for q in rag.get("search_queries", []):
+                if isinstance(q, str) and q.strip():
+                    add_source("Search query", q.strip(), "search_query", "")
+
+        if isinstance(be.get("discovered"), list):
+            for ev in be.get("discovered", []):
+                if isinstance(ev, dict):
+                    add_source(_safe_str(ev.get("title")), _safe_str(ev.get("uri")), "be_discovered", "")
+
+        if isinstance(be.get("evidence_docs"), list):
+            for ev in be.get("evidence_docs", []):
+                if isinstance(ev, dict):
+                    add_source(_safe_str(ev.get("title")), _safe_str(ev.get("uri")), "be_evidence_doc", "")
+
+        if isinstance(be.get("dois"), list):
+            for doi in be.get("dois", []):
+                d = str(doi).strip()
+                if d:
+                    add_source(f"DOI {d}", f"https://doi.org/{d}", "doi", "")
+
         protocol_title = f"Синопсис протокола исследования биоэквивалентности: {inn} {dose_str} мг ({regimen.lower() if regimen else 'условия не указаны'})"
+
+        evidence_summary = self._make_evidence_summary(rag_summary, rag, bibliography, warnings)
 
         return {
             "protocolTitle": protocol_title,
@@ -423,7 +474,85 @@ class YandexSynopsisGenerator:
             "yaml": "",
             "bibliography": bibliography,
             "studyType": study_type,
+            "evidenceSummary": evidence_summary,
+            "assumptions": warnings,
         }
+
+    def _make_evidence_summary(
+        self,
+        rag_summary: Dict[str, Any],
+        rag: Dict[str, Any],
+        bibliography: List[Dict[str, str]],
+        warnings: List[str],
+    ) -> str:
+        tmax = rag_summary.get("tmax_h")
+        t12 = rag_summary.get("t12_h")
+        cv_cmax = rag_summary.get("cvintra_cmax")
+        cv_auc = rag_summary.get("cvintra_auc")
+
+        def fmt(x: Any) -> str:
+            return "—" if x is None else str(x)
+
+        lines = [
+            f"Tmax: {fmt(tmax)} ч; T1/2: {fmt(t12)} ч.",
+            f"CVintra Cmax: {fmt(cv_cmax)}; CVintra AUC: {fmt(cv_auc)}.",
+        ]
+
+        if warnings:
+            lines.append("Предупреждения: " + "; ".join(str(w) for w in warnings[:6]))
+
+        if bibliography:
+            top = bibliography[:3]
+            src = []
+            for b in top:
+                title = (b.get("title") or "").strip()
+                uri = (b.get("uri") or "").strip()
+                if title and uri:
+                    src.append(f"{title} — {uri}")
+                elif title:
+                    src.append(title)
+            if src:
+                lines.append("Ключевые источники: " + " | ".join(src))
+
+        return " ".join(lines).strip()
+
+    def _llm_evidence_summary(self, base: Dict[str, Any], rag_ctx: Dict[str, Any]) -> str:
+        rag = rag_ctx.get("rag") or {}
+        rag_summary = rag_ctx.get("ragSummary") or {}
+        evidence = rag.get("evidence") if isinstance(rag.get("evidence"), list) else []
+        ev_compact = []
+        for ev in evidence[:6]:
+            if isinstance(ev, dict):
+                ev_compact.append(
+                    {
+                        "title": ev.get("title"),
+                        "uri": ev.get("uri"),
+                        "quote": ev.get("quote"),
+                        "used_for": ev.get("used_for"),
+                    }
+                )
+
+        prompt = f"""
+Ты заполняешь краткий блок "Источники и обоснование".
+ВАЖНО: Используй ТОЛЬКО данные из rag_summary и цитат evidence.
+Не выдумывай. Числа не меняй. Если значения нет — оставь "—".
+
+Верни СТРОГО JSON:
+{{
+  "evidenceSummary": "..."
+}}
+
+rag_summary={json.dumps(rag_summary, ensure_ascii=False)}
+evidence={json.dumps(ev_compact, ensure_ascii=False)}
+BASE_evidenceSummary={json.dumps(base.get("evidenceSummary",""), ensure_ascii=False)}
+"""
+        result = self.model.run(prompt)
+        text = result.alternatives[0].text if result and result.alternatives else ""
+        parsed = extract_json(text) or {}
+        if isinstance(parsed, dict):
+            val = parsed.get("evidenceSummary")
+            return str(val).strip() if val else ""
+        return ""
 
     def _llm_polish(self, base: Dict[str, Any], rag_ctx: Dict[str, Any]) -> Dict[str, Any]:
         rag = rag_ctx.get("rag") or {}
@@ -480,3 +609,102 @@ BASE:
         for k in self.LOCKED_KEYS:
             merged[k] = base.get(k)
         return merged
+
+    def _merge_missing(self, base: Dict[str, Any], filled: Dict[str, Any]) -> Dict[str, Any]:
+        if not filled:
+            return base
+        merged = dict(base)
+        for k, v in filled.items():
+            if k in self.LOCKED_KEYS:
+                continue
+            cur = merged.get(k)
+            if cur is None:
+                merged[k] = v
+                continue
+            if isinstance(cur, str) and not cur.strip() and isinstance(v, str) and v.strip():
+                merged[k] = v
+                continue
+            if isinstance(cur, list) and len(cur) == 0 and isinstance(v, list) and len(v) > 0:
+                merged[k] = v
+        return merged
+
+    def _llm_fill_missing(self, base: Dict[str, Any], rag_ctx: Dict[str, Any]) -> Dict[str, Any]:
+        rag = rag_ctx.get("rag") or {}
+        rag_summary = rag_ctx.get("ragSummary") or {}
+        decision = rag_ctx.get("decision") or {}
+        stats = rag_ctx.get("stats") or {}
+        timeline = rag_ctx.get("timeline") or {}
+
+        evidence = rag.get("evidence") if isinstance(rag.get("evidence"), list) else []
+        ev_compact = []
+        for ev in evidence[:8]:
+            if isinstance(ev, dict):
+                ev_compact.append(
+                    {
+                        "title": ev.get("title"),
+                        "uri": ev.get("uri"),
+                        "quote": ev.get("quote"),
+                        "used_for": ev.get("used_for"),
+                    }
+                )
+
+        prompt = f"""
+Ты заполняешь ПРОПУЩЕННЫЕ поля синопсиса на основе данных и источников.
+ВАЖНО:
+- НЕ МЕНЯЙ числовые значения, дизайн, расчёт выборки, таймпоинты, критерии БЭ.
+- Заполняй только пустые поля (пустая строка/пустой список).
+- Если данных нет — оставь поле пустым.
+Верни СТРОГО JSON с теми же ключами, что в base.
+
+rag_summary={json.dumps(rag_summary, ensure_ascii=False)}
+decision={json.dumps(decision, ensure_ascii=False)}
+stats={json.dumps(stats, ensure_ascii=False)}
+timeline={json.dumps(timeline, ensure_ascii=False)}
+evidence={json.dumps(ev_compact, ensure_ascii=False)}
+BASE:
+{json.dumps(base, ensure_ascii=False)}
+"""
+        result = self.model.run(prompt)
+        text = result.alternatives[0].text if result and result.alternatives else ""
+        parsed = extract_json(text) or {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _llm_full_fill(self, base: Dict[str, Any], rag_ctx: Dict[str, Any]) -> Dict[str, Any]:
+        rag = rag_ctx.get("rag") or {}
+        rag_summary = rag_ctx.get("ragSummary") or {}
+        decision = rag_ctx.get("decision") or {}
+        stats = rag_ctx.get("stats") or {}
+        timeline = rag_ctx.get("timeline") or {}
+
+        evidence = rag.get("evidence") if isinstance(rag.get("evidence"), list) else []
+        ev_compact = []
+        for ev in evidence[:8]:
+            if isinstance(ev, dict):
+                ev_compact.append(
+                    {
+                        "title": ev.get("title"),
+                        "uri": ev.get("uri"),
+                        "quote": ev.get("quote"),
+                        "used_for": ev.get("used_for"),
+                    }
+                )
+
+        prompt = f"""
+Ты заполняешь ВСЕ текстовые поля синопсиса на основе входных данных и источников.
+ВАЖНО:
+- НЕ МЕНЯЙ числовые значения, дизайн, расчёт выборки, таймпоинты, критерии БЭ.
+- Используй только данные из BASE и контекста.
+- Верни СТРОГО JSON с теми же ключами, что в base.
+
+rag_summary={json.dumps(rag_summary, ensure_ascii=False)}
+decision={json.dumps(decision, ensure_ascii=False)}
+stats={json.dumps(stats, ensure_ascii=False)}
+timeline={json.dumps(timeline, ensure_ascii=False)}
+evidence={json.dumps(ev_compact, ensure_ascii=False)}
+BASE:
+{json.dumps(base, ensure_ascii=False)}
+"""
+        result = self.model.run(prompt)
+        text = result.alternatives[0].text if result and result.alternatives else ""
+        parsed = extract_json(text) or {}
+        return parsed if isinstance(parsed, dict) else {}
