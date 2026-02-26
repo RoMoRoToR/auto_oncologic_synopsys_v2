@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: .
+      args:
+        VITE_API_URL: ""
+    environment:
+      # Core
+      - PYTHONUNBUFFERED=1
+      - FRONTEND_DIST=/app/frontend_dist
+      - DOCX_DIR=/app/data/docx
+      - GRLS_XLSX_PATH=/app/data/grls.xlsx
+      # Timeouts
+      - JOB_TIMEOUT_S=${JOB_TIMEOUT_S:-600}
+      - RAG_TIMEOUT_S=${RAG_TIMEOUT_S:-180}
+      - PDF_TIMEOUT_S=${PDF_TIMEOUT_S:-180}
+      - MAX_PDF_MB=${MAX_PDF_MB:-30}
+      - SYNOPSIS_USE_LLM=${SYNOPSIS_USE_LLM:-1}
+      # API keys (optional)
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - YANDEX_FOLDER_ID=${YANDEX_FOLDER_ID:-}
+      - YANDEX_AUTH_KEY=${YANDEX_AUTH_KEY:-}
+    volumes:
+      - ./data:/app/data
+    expose:
+      - "8000"
+    command: >
+      sh -c "uvicorn apps.api.api:app
+      --host 0.0.0.0
+      --port 8000
+      --workers ${WEB_CONCURRENCY:-2}
+      --proxy-headers
+      --forwarded-allow-ips=*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import requests;print(requests.get('http://localhost:8000/api/health').status_code)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
